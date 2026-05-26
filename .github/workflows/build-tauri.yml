@@ -97,6 +97,9 @@ jobs:
           releaseDraft: ${{ github.event.inputs.publish_release != 'false' }}
           prerelease: false
           args: ${{ matrix.args }}
+          # tauri 2.x 不再产 legacy latest.json · 我们自己维护 release.json/binary.json
+          # 关掉避免 "Signature not found for the updater JSON" 导致 exit 1
+          includeUpdaterJson: false
 
       # 8 · 额外上传 artifact 一份 (UI 上方便下载 · 即使没发 release)
       - name: upload artifacts (debug)

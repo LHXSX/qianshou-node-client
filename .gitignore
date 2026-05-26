@@ -48,3 +48,6 @@ yarn-error.log*
 # tauri-cli pull tauri-build cache
 src-tauri/Cargo.lock
 .tauri-keys/
+
+# 国内 cargo 镜像配置 (本地 · CI 用官方)
+src-tauri/.cargo/
