@@ -19,8 +19,8 @@
     "baseUrl": ".",
     "paths": {
       "@/*": ["src/*"],
-      "@shared": ["../frontend/shared/index.ts"],
-      "@shared/*": ["../frontend/shared/*"]
+      "@shared": ["./shared/index.ts"],
+      "@shared/*": ["./shared/*"]
     }
   },
   "include": [
