@@ -29,7 +29,9 @@ jobs:
             args: '--target x86_64-apple-darwin'
             label: 'macos-intel'
           - platform: 'windows-latest'
-            args: '--target x86_64-pc-windows-msvc'
+            # --bundles nsis · 跳 MSI (WIX light.exe 不支持中文路径 "千手节点_x.x.x_x64_en-US.msi" 会挂)
+            # NSIS .exe 已包含全部安装/卸载功能 · 企业 IT 部署也支持静默 /S
+            args: '--target x86_64-pc-windows-msvc --bundles nsis'
             label: 'windows-x64'
           # Linux 暂关 · 想开打开即可
           # - platform: 'ubuntu-22.04'
