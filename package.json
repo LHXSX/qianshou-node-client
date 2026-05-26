@@ -1,6 +1,6 @@
 {
   "name": "qianshou-client",
-  "version": "8.0.17.1",
+  "version": "8.0.18",
   "private": true,
   "description": "千手 · EdgeCompute 边缘算力桌面客户端— Tauri 2 + Vue 3",
   "type": "module",
