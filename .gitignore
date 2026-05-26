@@ -1,0 +1,50 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# build output
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# env / secrets
+.env
+.env.local
+
+# Tauri 签名私钥 · 严禁 push 到 GitHub! (放 GH Secrets 里)
+.tauri-keys-2026/*.key
+.tauri-keys/*.key
+**/qianshou-*.key
+
+# CI build artifacts
+src-tauri/gen/schemas/
+
+# 系统/IDE
+Thumbs.db
+.DS_Store
+.env.*.local
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Tauri build artifacts
+*.dmg
+*.app
+*.msi
+*.exe
+*.deb
+*.AppImage
+
+# tauri-cli pull tauri-build cache
+src-tauri/Cargo.lock
+.tauri-keys/

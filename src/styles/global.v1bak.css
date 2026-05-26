@@ -1,0 +1,175 @@
+/* ═══════════════════════════════════════════════════════════
+   EdgeCompute Design Tokens —— 多巴胺亮色 + 圆融 + 大字号
+   通过 [data-theme="dark"] 切换深色
+   ═══════════════════════════════════════════════════════════ */
+
+:root,
+[data-theme="light"] {
+  /* 背景层 */
+  --c-bg:        #f4f6fb;   /* 整体冰蓝白 */
+  --c-bg-card:   #ffffff;   /* 卡片纯白 */
+  --c-bg-soft:   #edf1f8;   /* 次级背景（hover / chip） */
+  --c-bg-input:  #ffffff;
+  --c-bg-elev:   #ffffff;   /* 浮层 */
+
+  /* 边框层 */
+  --c-border:        #dde2ec;
+  --c-border-strong: #c1c9d6;
+  --c-border-focus:  #6366f1;
+
+  /* 文字层 —— 浅色模式必须够深才不模糊 */
+  --c-fg:       #0f172a;    /* 主文字 near-black */
+  --c-fg-soft:  #334155;    /* 次文字 slate-700 */
+  --c-mute:     #64748b;    /* 弱文字 slate-500 仍清晰可读 */
+  --c-fg-on-accent: #ffffff;
+
+  /* 多巴胺主色（紫蓝 → 粉） */
+  --c-accent:    #6366f1;
+  --c-accent-2:  #a855f7;
+  --c-accent-3:  #ec4899;
+  --c-accent-soft: rgba(99, 102, 241, 0.12);
+
+  /* 状态色 */
+  --c-ok:    #10b981;
+  --c-warn:  #f59e0b;
+  --c-err:   #ef4444;
+  --c-info:  #3b82f6;
+
+  --c-ok-soft:   rgba(16, 185, 129, 0.12);
+  --c-warn-soft: rgba(245, 158, 11, 0.14);
+  --c-err-soft:  rgba(239, 68, 68, 0.12);
+
+  /* 渐变（多巴胺） */
+  --grad-primary: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
+  --grad-cool:    linear-gradient(135deg, #3b82f6, #6366f1);
+  --grad-warm:    linear-gradient(135deg, #f59e0b, #ec4899);
+
+  /* 圆角 —— 圆融 */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 18px;
+  --r-xl: 22px;
+  --r-full: 999px;
+
+  /* 阴影 —— 友好的轻盈感 */
+  --sh-sm: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06);
+  --sh-md: 0 4px 10px rgba(15, 23, 42, 0.06), 0 2px 4px rgba(15, 23, 42, 0.04);
+  --sh-lg: 0 10px 30px rgba(15, 23, 42, 0.10), 0 4px 12px rgba(15, 23, 42, 0.06);
+  --sh-glow: 0 0 0 4px rgba(99, 102, 241, 0.16);
+
+  /* 字号 */
+  --fs-xs: 11px;
+  --fs-sm: 12.5px;
+  --fs-base: 14px;
+  --fs-md: 15px;
+  --fs-lg: 17px;
+  --fs-xl: 20px;
+  --fs-2xl: 24px;
+  --fs-3xl: 30px;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Dark theme —— 优雅深空蓝紫
+   ═══════════════════════════════════════════════════════════ */
+[data-theme="dark"] {
+  --c-bg:        #0d1117;
+  --c-bg-card:   #161b22;
+  --c-bg-soft:   #1d2230;
+  --c-bg-input:  #1d2230;
+  --c-bg-elev:   #1c2230;
+
+  --c-border:        #252a36;
+  --c-border-strong: #353b4b;
+  --c-border-focus:  #7c8cff;
+
+  --c-fg:       #e8ebf0;
+  --c-fg-soft:  #b8bec9;
+  --c-mute:     #6b7385;
+  --c-fg-on-accent: #ffffff;
+
+  --c-accent:    #7c8cff;
+  --c-accent-2:  #b372ff;
+  --c-accent-3:  #ff5e9c;
+  --c-accent-soft: rgba(124, 140, 255, 0.16);
+
+  --c-ok:    #34d399;
+  --c-warn:  #fbbf24;
+  --c-err:   #f87171;
+  --c-info:  #60a5fa;
+
+  --c-ok-soft:   rgba(52, 211, 153, 0.16);
+  --c-warn-soft: rgba(251, 191, 36, 0.16);
+  --c-err-soft:  rgba(248, 113, 113, 0.16);
+
+  --grad-primary: linear-gradient(135deg, #7c8cff 0%, #b372ff 50%, #ff5e9c 100%);
+  --grad-cool:    linear-gradient(135deg, #60a5fa, #7c8cff);
+  --grad-warm:    linear-gradient(135deg, #fbbf24, #ff5e9c);
+
+  --sh-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --sh-md: 0 4px 10px rgba(0, 0, 0, 0.4), 0 2px 4px rgba(0, 0, 0, 0.3);
+  --sh-lg: 0 10px 30px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.3);
+  --sh-glow: 0 0 0 4px rgba(124, 140, 255, 0.24);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Base
+   ═══════════════════════════════════════════════════════════ */
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  background: var(--c-bg);
+  color: var(--c-fg);
+  font-size: 16px;
+  /* 优先系统字体 —— 中文 PingFang/苹方先于 Inter，避免 Inter 对中文的 fallback 模糊 */
+  font-family:
+    -apple-system, BlinkMacSystemFont,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei",
+    "Helvetica Neue", "Segoe UI", Roboto, Arial, sans-serif;
+  font-weight: 400;
+  /* 关键：浅色背景下 auto / subpixel-antialiased 比 antialiased 清晰得多 */
+  -webkit-font-smoothing: auto;
+  -moz-osx-font-smoothing: auto;
+  /* 不要 optimizeLegibility —— 它在小字号下反而模糊 */
+  text-rendering: geometricPrecision;
+  line-height: 1.5;
+  letter-spacing: 0;
+  /* 不要在 body 上加 transition —— 会触发 GPU compositing 让所有子元素文字模糊 */
+}
+
+/* 主题切换的颜色过渡只放到 background 上的"非文字"元素，不影响文字层 */
+
+button { font-family: inherit; cursor: pointer; }
+input, select, textarea { font-family: inherit; color: var(--c-fg); }
+
+code, pre {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular,
+               "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+/* Scrollbar 圆润 */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--c-border-strong);
+  border-radius: var(--r-full);
+  border: 2px solid var(--c-bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--c-mute);
+}
+
+/* 选中色 */
+::selection {
+  background: var(--c-accent-soft);
+  color: var(--c-fg);
+}
+
+/* 链接 */
+a {
+  color: var(--c-accent);
+  text-decoration: none;
+  transition: opacity 0.12s;
+}
+a:hover { opacity: 0.85; }

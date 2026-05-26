@@ -1,0 +1,111 @@
+[package]
+name = "qianshou-client"
+version = "8.0.17"
+description = "千手 · EdgeCompute 边缘算力桌面客户端"
+authors = ["EdgeCompute Team"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "qianshou_client_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# ── Tauri 核心 ──
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-autostart = "2"
+
+# ── async runtime ──
+tokio = { version = "1", features = ["full"] }
+
+# ── WebSocket 主通道 ──
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+native-tls = "0.2"
+futures-util = "0.3"
+http = "1"
+
+# ── REST 兜底 ──
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip"], default-features = false }
+
+# ── 序列化 ──
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── 凭证持久化（v3.0.0：app_data 文件 + 0o600 权限）──
+# 后续可切回 OS Keyring（生产签名稳定后用户只授权一次），暂不依赖。
+
+# ── 日志 ──
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# ── 错误 / 工具 ──
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sysinfo = "0.32"
+url = "2"
+tempfile = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+which = "7"  # v8 capabilities · 探测节点安装的 software (ffmpeg / blender / ollama / ...)
+sha2 = "0.10"  # V8 task_skill_pack sha256 校验
+flate2 = "1"  # 2026-05-24 · ffmpeg tier tar.gz 解压
+tar = "0.4"   # 2026-05-24 · ffmpeg tier tar.gz 解压
+opener = "0.7"
+base64 = "0.22"  # W3 (2026-05-26) · IP 代理池 · TunnelChunk 数据 base64 编解码
+
+# P0 NCE · 任务资源限制 (setpriority 跨平台)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# 默认空，Tauri custom-protocol 由 build.rs 自动注入 release 模式
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+
+# ────────────────────────────────────────────────────────────────────
+# Release profile (P0-4 企业级合规)
+# 目标：包大小 ≤ 应有 70%、启动时间 ≤ 1.5s、无调试符号泄露。
+# 实测对比（2026-05-15）：未优化 ≈ 26 MB / 优化后 ≈ 16 MB / dmg 约 11 MB
+# ────────────────────────────────────────────────────────────────────
+[profile.release]
+opt-level = "z"          # 体积优先；CPU-bound 任务可改 "s" 或 3
+lto = "fat"              # 链接时优化（构建时长 +30s，但减小 25%）
+codegen-units = 1        # 关闭并行 codegen 才能让 LTO 完整生效
+panic = "abort"          # 客户端 unwrap panic 直接 abort，更小，更快
+strip = "symbols"        # 去掉调试符号；崩溃栈靠 Sentry/dSYM 恢复
+debug = false
+incremental = false
+
+# dev profile 保持快速迭代，不动
+[profile.dev]
+incremental = true
+
+
+# ────────────────────────────────────────────────────────────────────
+# Lints (P0-2 企业级合规)
+# warn 级别提醒新代码避免 unwrap/expect/panic，旧代码循序渐进治理。
+# 严格 deny 会破坏现有 50+ unwrap，先用 warn 让 cargo clippy 报告。
+# ────────────────────────────────────────────────────────────────────
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+# 业务逻辑常用，关闭噪音
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+
+[lints.rust]
+unused_must_use = "warn"
+# Tauri 自动生成的 #[command] handler 偶尔有 unused arg
+unused_variables = "warn"

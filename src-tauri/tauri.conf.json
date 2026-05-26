@@ -1,0 +1,87 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "千手节点",
+  "version": "8.0.17",
+  "identifier": "com.qianshou.node-client",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "千手节点",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 1000,
+        "minHeight": 640,
+        "resizable": true,
+        "center": true,
+        "decorations": true,
+        "transparent": false,
+        "titleBarStyle": "Visible",
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "千手 · 边缘算力贡献客户端",
+    "longDescription": "千手：把闲置算力贡献给 EdgeCompute 网络，获得 EDG 收益。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": null
+    },
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      },
+      "nsis": {
+        "languages": [
+          "English",
+          "SimpChinese"
+        ],
+        "installerIcon": "icons/icon.ico"
+      }
+    },
+    "createUpdaterArtifacts": true,
+    "resources": [
+      "resources/bin/*",
+      "resources/runtime/**/*"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ0NDI4OTg1NUZEQkM0OEUKUldTT3hOdGZoWWxDUkYraWxUZmhIMm1DWDAvb3BIWVI0VUw4SnZkaVRMRytnb2h3cFMybVJZT28K",
+      "endpoints": [
+        "https://www.wujisuanli.com/api/v8/client/updater/{{target}}/{{arch}}/{{current_version}}",
+        "https://pidbai.com/api/v8/client/updater/{{target}}/{{arch}}/{{current_version}}"
+      ]
+    },
+    "deep-link": {
+      "mobile": [],
+      "desktop": {
+        "schemes": [
+          "edgecompute"
+        ]
+      }
+    }
+  }
+}
