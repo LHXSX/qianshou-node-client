@@ -7,8 +7,14 @@
 #
 # Mac arm64 不动 (已手工发了 · binary.json 里 darwin-aarch64 已经 8.1.0)
 #
-# 用法:
+# 用法 (auto mode · 从 GH Release 拉):
 #   GH_TOKEN=ghp_xxx ./scripts/publish-from-release.sh
+#
+# 用法 (manual mode · 文件手工下好了):
+#   mkdir -p /tmp/qianshou-8.1.0-release
+#   浏览器打 https://github.com/LHXSX/qianshou-node-client/releases/tag/v8.1.0
+#   下 5 个 asset 到 /tmp/qianshou-8.1.0-release/
+#   MANUAL=1 ./scripts/publish-from-release.sh
 #
 # 设计要点 (避坑):
 #   - 中文文件名在 scp/ssh 链里被 zsh / bash / ssh 多次解析容易乱
@@ -20,7 +26,11 @@ set -euo pipefail
 VERSION="${VERSION:-8.1.0}"
 REPO="${REPO:-LHXSX/qianshou-node-client}"
 SSH_HOST="${SSH_HOST:-edge}"
-GH_TOKEN="${GH_TOKEN:?需 GH_TOKEN env · GitHub PAT}"
+MANUAL="${MANUAL:-0}"   # 1 = 跳过下载 · 直接用 WORKDIR 里现有文件
+
+if [ "${MANUAL}" != "1" ]; then
+  GH_TOKEN="${GH_TOKEN:?需 GH_TOKEN env (或 MANUAL=1 则跳过下载)}"
+fi
 
 TAG="v${VERSION}"
 WORKDIR="/tmp/qianshou-${VERSION}-release"
@@ -42,6 +52,33 @@ ok()   { printf "${GRN}✓${NC} %s\n" "$*"; }
 warn() { printf "${YEL}⚠${NC} %s\n" "$*" >&2; }
 err()  { printf "${RED}✗${NC} %s\n" "$*" >&2; }
 
+# ─────────────────────────────────────────────────────────
+# 0. Manual mode 分支 (MANUAL=1 时跳过下载 · 直接用 WORKDIR 里现有文件)
+# ─────────────────────────────────────────────────────────
+SKIP_DOWNLOAD=0
+if [ "${MANUAL}" = "1" ]; then
+  log "MANUAL=1 · 跳过下载 · 用 ${WORKDIR} 里现有文件"
+  if [ ! -d "${WORKDIR}" ]; then
+    err "${WORKDIR} 不存在 · 先 mkdir + 下 5 个 asset 到这"
+    exit 1
+  fi
+  missing=()
+  for f in "${EXPECT_FILES[@]}"; do
+    if [ ! -f "${WORKDIR}/${f}" ]; then
+      missing+=("${f}")
+    fi
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    err "${WORKDIR} 缺 ${#missing[@]} 个文件:"
+    printf '  - %s\n' "${missing[@]}" >&2
+    exit 1
+  fi
+  ok "5 个文件齐"
+  ls -la "${WORKDIR}"
+  SKIP_DOWNLOAD=1
+fi
+
+if [ "${SKIP_DOWNLOAD}" = "0" ]; then
 # ─────────────────────────────────────────────────────────
 # 1. 等 release ready
 # ─────────────────────────────────────────────────────────
@@ -118,6 +155,7 @@ while IFS=$'\t' read -r url name; do
 done < /tmp/qianshou_assets.tsv
 
 ls -la "${WORKDIR}"
+fi  # SKIP_DOWNLOAD
 
 # ─────────────────────────────────────────────────────────
 # 3. 全部打 tar 传上服务器 (绕开中文 scp 坑)
