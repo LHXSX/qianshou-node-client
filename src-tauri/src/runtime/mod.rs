@@ -21,3 +21,4 @@ pub mod skills_fetcher;
 pub mod commands;
 pub mod bootstrap_bundled;
 pub mod garbage_collect;
+pub mod auto_install_tiers;

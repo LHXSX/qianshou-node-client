@@ -112,7 +112,14 @@ async fn spawn_python_tool(
         ));
     }
 
-    let mut command = Command::new("python3");
+    // V8.1 (2026-05-27) · 跟 executor.rs 共用路由 · 优先用 venvs/<tier>/bin/python
+    // skill_exec 不带 required_tier (skill 元数据未来可扩展) · 走默认 lite 兜底
+    let (python_bin, bundled_pp) = crate::runtime::paths::pick_python_with_hint(None, &[]);
+    tracing::info!(
+        "tool_caller · skill={} tool={} python={}",
+        skill.id, tool.name, python_bin
+    );
+    let mut command = Command::new(&python_bin);
     crate::proc_util::hide_window_tokio(&mut command);
     command
         .arg(entry_file)
@@ -122,9 +129,24 @@ async fn spawn_python_tool(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    // 老路径 fallback 时塞 PYTHONPATH (cpython + envs/{image,base})
+    if !bundled_pp.is_empty() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let mut parts: Vec<String> = bundled_pp
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        if let Ok(existing) = std::env::var("PYTHONPATH") {
+            if !existing.is_empty() {
+                parts.push(existing);
+            }
+        }
+        command.env("PYTHONPATH", parts.join(sep));
+    }
+
     let mut child = command
         .spawn()
-        .with_context(|| format!("启动 python3 失败 (skill={} tool={})", skill.id, tool.name))?;
+        .with_context(|| format!("启动 python ({}) 失败 (skill={} tool={})", python_bin, skill.id, tool.name))?;
 
     // 喂 stdin
     if let Some(mut stdin) = child.stdin.take() {

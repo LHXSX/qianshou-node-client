@@ -60,6 +60,15 @@ pub struct TaskAssign {
     /// 用这个**任务专用副本**取代原始 bundle 的 runner_code。
     #[serde(default)]
     pub skill_pack_id: Option<String>,
+    /// V8.1 (2026-05-27) · 运行时 tier 路由 · executor 按此选 venvs/<tier>/bin/python 跑
+    ///   "" (默认) → 用 fallback_tiers · 都没装则用 lite 兜底 · 仍没就系统 python3
+    ///   "ocr" / "speech" / "vision-ai" / "lite" / "crawl" → 强制对应 venv
+    /// 老服务端 (8.0.x) 不发此字段 · serde::default 取空 · 客户端走老路径 (打包 cpython)
+    #[serde(default)]
+    pub required_tier: String,
+    /// V8.1 · required_tier 没装时的兜底 tier (按顺序 try)
+    #[serde(default)]
+    pub fallback_tiers: Vec<String>,
 }
 
 fn default_task_type() -> String {

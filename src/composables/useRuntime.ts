@@ -30,6 +30,8 @@ export interface BinarySpec {
 
 export interface RuntimeTierSpec {
   required: boolean
+  /** V8.1 · 客户端首次启动自动装此 tier */
+  auto_install?: boolean
   description: string
   packages: string[]
   pip_args?: string[]

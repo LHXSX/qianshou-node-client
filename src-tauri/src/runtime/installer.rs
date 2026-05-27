@@ -24,12 +24,12 @@ use tokio::process::Command;
 use super::detector::{
     check_python, read_installed_meta, write_installed_meta, InstalledTier,
 };
-use super::manifest::{self, BinarySpec, MirrorSource, PrebuiltVenvSpec, TierSpec};
+use super::manifest::{self, BinarySpec, MirrorSource, PrebuiltVenvSpec, SystemBinarySpec, TierSpec};
 use super::paths;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-const PIP_TIMEOUT_SECS: u64 = 600; // 单源最长 10 分钟
+const PIP_TIMEOUT_SECS: u64 = 180; // 单源最长 3 分钟 (2026-05-27 改: 之前 600s · 6 个镜像最差 60min)
 const SMOKE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize)]
@@ -673,7 +673,7 @@ async fn run_install_binaries_only(
 }
 
 /// 2026-05-24 · system-command-only tier 安装入口
-/// 例: render tier 依赖 blender CLI · 节点 which 探测 · 缺则 fail · 不撒谎
+/// 例: render tier 依赖 blender CLI · 节点 which 探测 · 缺则自动装 · 装不上才 fail
 async fn run_install_system_check_only(
     job_id: &str,
     tier: &str,
@@ -697,16 +697,117 @@ async fn run_install_system_check_only(
         }
     }
     if !missing.is_empty() {
-        // 给用户复制粘贴指引 · 按 OS 取
+        // V8.1 (2026-05-27) · 优先方案 · 直下二进制 (绕开 brew/winget · 不需 sudo)
+        // 老后端不发 system_binaries = 空 map · 这段秒过 · 走下面 brew/winget 老路径
+        let platform_key = detect_platform_key();
+        if let Some(bin_spec) = spec.system_binaries.get(&platform_key) {
+            emit_log(app, job_id, tier,
+                &format!("▶ V8.1 直下二进制 · 平台 {} · {} (~{} MB · 不需 brew/winget)",
+                    platform_key, bin_spec.kind, bin_spec.size_mb), false);
+            match try_install_system_binary(app, job_id, tier, bin_spec).await {
+                Ok(bin_abs) => {
+                    emit_log(app, job_id, tier,
+                        &format!("✓ 直下成功 · binary = {}", bin_abs.display()), false);
+                    let abs_str = bin_abs.to_string_lossy().to_string();
+                    // 满足所有 missing 命令 (当前 spec 是单命令 · 但留多命令余地)
+                    for cmd in missing.iter() {
+                        found_paths.insert(cmd.clone(), abs_str.clone());
+                    }
+                    missing.clear();
+                }
+                Err(e) => {
+                    emit_log(app, job_id, tier,
+                        &format!("⚠ 直下失败: {} · 退到 brew/winget 老路径", e), true);
+                }
+            }
+        } else if !spec.system_binaries.is_empty() {
+            emit_log(app, job_id, tier,
+                &format!("⚠ system_binaries 不含平台 {} (有: {:?}) · 退到 brew/winget",
+                    platform_key,
+                    spec.system_binaries.keys().collect::<Vec<_>>()), true);
+        }
+    }
+
+    if !missing.is_empty() {
+        // 2026-05-27 · 自动尝试安装缺失的系统命令 (brew / winget / apt) · 老路径
         let os_key = if cfg!(target_os = "macos") { "macos" }
                      else if cfg!(target_os = "windows") { "windows" }
                      else { "linux" };
         let hint = spec.install_hint.get(os_key).cloned()
-            .unwrap_or_else(|| format!("请先安装 {} CLI 后重试", missing.join(", ")));
-        return Err(anyhow!(
-            "tier `{}` 需要系统命令 [{}] 但未找到 · 安装指引:\n  {}\n安装完成后请重新点击 '安装 {}' 按钮",
-            tier, missing.join(", "), hint, tier
-        ));
+            .unwrap_or_default();
+
+        if !hint.is_empty() {
+            emit_log(app, job_id, tier,
+                &format!("▶ 自动安装系统依赖: {}", hint), false);
+
+            let shell_cmd = if cfg!(target_os = "windows") { "cmd" } else { "/bin/sh" };
+            let shell_flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+            let mut auto_cmd = Command::new(shell_cmd);
+            auto_cmd.arg(shell_flag).arg(&hint);
+            // macOS brew 需要 PATH 包含 /opt/homebrew/bin 和 /usr/local/bin
+            auto_cmd.env("PATH", build_path_with(&[]));
+
+            match run_capture(app, job_id, tier, &mut auto_cmd, Duration::from_secs(600)).await {
+                Ok(()) => {
+                    emit_log(app, job_id, tier, "✓ 自动安装命令执行成功", false);
+                }
+                Err(e) => {
+                    emit_log(app, job_id, tier,
+                        &format!("⚠ 自动安装失败: {} · 将重新检测", e), true);
+                }
+            }
+
+            // 重新探测 · 自动装完后再试一次 which
+            emit_log(app, job_id, tier, "▶ 重新检测系统命令…", false);
+            missing.clear();
+            for cmd in &spec.system_commands {
+                match which::which(cmd) {
+                    Ok(p) => {
+                        emit_log(app, job_id, tier, &format!("  ✓ {} → {}", cmd, p.display()), false);
+                        found_paths.insert(cmd.clone(), p.to_string_lossy().to_string());
+                    }
+                    Err(_) => {
+                        // macOS: brew 安装的 GUI app 可能在 /Applications 但 CLI 不在 PATH
+                        // 尝试常见路径
+                        let extra_paths: &[&str] = if cfg!(target_os = "macos") {
+                            &[
+                                "/opt/homebrew/bin",
+                                "/usr/local/bin",
+                                "/Applications/Blender.app/Contents/MacOS",
+                            ]
+                        } else {
+                            &["/usr/local/bin", "/snap/bin"]
+                        };
+                        let mut resolved = false;
+                        for dir in extra_paths {
+                            let candidate = std::path::PathBuf::from(dir).join(cmd);
+                            if candidate.exists() {
+                                emit_log(app, job_id, tier,
+                                    &format!("  ✓ {} → {} (额外路径)", cmd, candidate.display()), false);
+                                found_paths.insert(cmd.clone(), candidate.to_string_lossy().to_string());
+                                resolved = true;
+                                break;
+                            }
+                        }
+                        if !resolved {
+                            emit_log(app, job_id, tier, &format!("  ✗ {} · 仍未找到", cmd), true);
+                            missing.push(cmd.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "安装失败: tier `{}` 需要系统命令 [{}] 但未找到\n\
+                 自动安装未成功 · 请手动执行:\n  {}\n\
+                 安装完成后请重新点击 '安装 {}' 按钮",
+                tier, missing.join(", "),
+                if hint.is_empty() { format!("请先安装 {} CLI", missing.join(", ")) } else { hint },
+                tier
+            ));
+        }
     }
 
     // smoke_test (例如 `blender --version`)
@@ -717,6 +818,11 @@ async fn run_install_system_check_only(
         let shell_flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
         let mut sm = Command::new(shell_cmd);
         sm.arg(shell_flag).arg(&spec.smoke_test);
+        // V8.1 · 把 found_paths 的父目录加进 PATH · 让直下的 blender 等命令可见
+        let extra_bin_dirs: Vec<PathBuf> = found_paths.values()
+            .filter_map(|p| std::path::Path::new(p).parent().map(|x| x.to_path_buf()))
+            .collect();
+        sm.env("PATH", build_path_with(&extra_bin_dirs));
         run_capture(app, job_id, tier, &mut sm, Duration::from_secs(SMOKE_TIMEOUT_SECS))
             .await
             .map_err(|e| anyhow!("smoke_test 失败: {} · 请检查 {} 命令可用性", e, spec.system_commands.join(",")))?;
@@ -1033,4 +1139,243 @@ pub async fn recheck_tier(tier: &str) -> InstalledTier {
         t.last_message = "venv python 探测失败".into();
     }
     t
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// V8.1 (2026-05-27) · 直下系统二进制 · 绕开 brew/winget · 不需 sudo
+// 用于 render tier (blender) 类 · backend manifest 给各平台直下 URL
+// 流程: 下 dmg/zip/tarxz → 解到 system_bin/<tier>/ → 写绝对路径到 found_paths
+// → run_install_system_check_only 写 installed.json.binaries
+// → executor.rs 自动加到子进程 PATH + EC_TIER_BINARIES_JSON
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 平台 key · 跟后端 manifest.system_binaries 的 key 一致
+/// 例: "macos-arm64" / "macos-x64" / "windows-x64" / "linux-x64"
+fn detect_platform_key() -> String {
+    let os = std::env::consts::OS;
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("{}-{}", os, arch)
+}
+
+/// 主入口 · 给定 tier 的 SystemBinarySpec · 下载 + 解压 + 返回 binary 绝对路径
+async fn try_install_system_binary(
+    app: &AppHandle,
+    job_id: &str,
+    tier: &str,
+    spec: &SystemBinarySpec,
+) -> Result<PathBuf> {
+    let dest_dir = paths::system_bin_root(tier);
+    if dest_dir.exists() {
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| anyhow!("创建 system_bin/{} 失败: {}", tier, e))?;
+
+    // 主源 + 镜像 · 顺序 fallback
+    let mut urls = vec![spec.url.clone()];
+    urls.extend(spec.mirrors.iter().cloned());
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1800))
+        .user_agent(format!("EdgeCompute-Client/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| anyhow!("reqwest client: {}", e))?;
+
+    let tmpdir = tempfile::tempdir().map_err(|e| anyhow!("tempdir: {}", e))?;
+    let ext = match spec.kind.as_str() {
+        "dmg" => "dmg",
+        "zip" => "zip",
+        "tarxz" => "tar.xz",
+        "targz" => "tar.gz",
+        _ => "bin",
+    };
+    let archive_path = tmpdir.path().join(format!("binary.{}", ext));
+
+    let mut last_err: Option<String> = None;
+    let mut downloaded = false;
+    for url in &urls {
+        emit_log(app, job_id, tier,
+            &format!("▶ 下载 {} (~{} MB) · {}", spec.kind, spec.size_mb, url), false);
+        match download_to_file(&client, url, &archive_path).await {
+            Ok(_) => {
+                let bytes = std::fs::metadata(&archive_path).ok()
+                    .map(|m| m.len()).unwrap_or(0);
+                emit_log(app, job_id, tier,
+                    &format!("✓ 下载完成 · {} MB", bytes / 1024 / 1024), false);
+                downloaded = true;
+                break;
+            }
+            Err(e) => {
+                emit_log(app, job_id, tier,
+                    &format!("⚠ 下载失败: {} · 试下一镜像", e), true);
+                last_err = Some(e.to_string());
+            }
+        }
+    }
+    if !downloaded {
+        return Err(anyhow!("所有镜像都下载失败: {}",
+            last_err.unwrap_or_else(|| "unknown".into())));
+    }
+
+    // 可选 sha256 校验
+    if !spec.sha256.is_empty() {
+        emit_log(app, job_id, tier, "▶ 校验 sha256…", false);
+        let bytes = std::fs::read(&archive_path)
+            .map_err(|e| anyhow!("读 archive: {}", e))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let got = format!("{:x}", hasher.finalize());
+        if got != spec.sha256 {
+            return Err(anyhow!("sha256 不匹配 · 期望 {} 得 {}", spec.sha256, got));
+        }
+        emit_log(app, job_id, tier, "✓ sha256 通过", false);
+    }
+
+    emit_log(app, job_id, tier,
+        &format!("▶ 解压 {} → {}", spec.kind, dest_dir.display()), false);
+    match spec.kind.as_str() {
+        "dmg" => extract_dmg(&archive_path, &dest_dir, app, job_id, tier).await?,
+        "zip" => extract_zip(&archive_path, &dest_dir)?,
+        "tarxz" => extract_tar_xz(&archive_path, &dest_dir).await?,
+        "targz" => extract_tar_gz(&archive_path, &dest_dir)?,
+        other => return Err(anyhow!("不支持的包格式: {}", other)),
+    }
+    emit_log(app, job_id, tier, "✓ 解压完成", false);
+
+    let bin_abs = dest_dir.join(&spec.binary);
+    if !bin_abs.exists() {
+        return Err(anyhow!("解压后未找到 binary: {} · 检查 manifest.binary 字段",
+            bin_abs.display()));
+    }
+
+    // chmod +x (unix · dmg 出来的 .app/MacOS/Blender 默认就是 755 · 但兜底)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&bin_abs) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&bin_abs, perms);
+        }
+    }
+
+    // V8.1 · Unix 在 dest_dir 顶层 symlink 一个 exposes 名 (例: blender → Blender.app/.../Blender)
+    //   解决: macOS .app 内大写 Blender · shell PATH 找 blender 命中不了 (即使 APFS 大小写不敏感 · 实测有边角 case)
+    //   Win 跳过 · 因为 blender.exe 依赖同目录 _python/python311.dll · 不能单文件 cp · 让 executor 把 .exe 所在目录加 PATH 即可
+    #[cfg(unix)]
+    {
+        if !spec.exposes.is_empty() {
+            let expose_path = dest_dir.join(&spec.exposes);
+            let _ = std::fs::remove_file(&expose_path);
+            match std::os::unix::fs::symlink(&bin_abs, &expose_path) {
+                Ok(()) if expose_path.exists() => {
+                    emit_log(app, job_id, tier,
+                        &format!("✓ 暴露命令 {} → {}", spec.exposes, expose_path.display()), false);
+                    // 返回 symlink 路径 · 父目录 dest_dir 进 PATH · `blender` 直接命中
+                    return Ok(expose_path);
+                }
+                Ok(()) => {
+                    emit_log(app, job_id, tier,
+                        &format!("⚠ symlink 创建后不存在 (异常) · 退用原 binary"), true);
+                }
+                Err(e) => {
+                    emit_log(app, job_id, tier,
+                        &format!("⚠ symlink 失败: {} · 退用原 binary 路径", e), true);
+                }
+            }
+        }
+    }
+
+    Ok(bin_abs)
+}
+
+/// DMG 解压 (macOS) · hdiutil attach + cp -R + detach
+#[cfg(target_os = "macos")]
+async fn extract_dmg(
+    archive: &PathBuf, dest: &PathBuf,
+    app: &AppHandle, job_id: &str, tier: &str,
+) -> Result<()> {
+    use std::collections::HashSet;
+    // 记下挂载前的 /Volumes 内容 · 挂载后做 diff 找新加的 (比 mtime 准)
+    let before: HashSet<String> = std::fs::read_dir("/Volumes")
+        .map(|rd| rd.flatten()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default();
+
+    emit_log(app, job_id, tier, "▶ hdiutil attach …", false);
+    let out = Command::new("hdiutil")
+        .args(["attach"])
+        .arg(archive)
+        .args(["-nobrowse", "-quiet"])
+        .output().await
+        .map_err(|e| anyhow!("hdiutil attach: {}", e))?;
+    if !out.status.success() {
+        return Err(anyhow!("hdiutil attach exit {}: {}",
+            out.status, String::from_utf8_lossy(&out.stderr)));
+    }
+
+    let after: HashSet<String> = std::fs::read_dir("/Volumes")
+        .map(|rd| rd.flatten()
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default();
+    let new_volumes: Vec<String> = after.difference(&before).cloned().collect();
+    if new_volumes.is_empty() {
+        return Err(anyhow!("hdiutil attach 后没新增 /Volumes 目录"));
+    }
+    let mount = PathBuf::from("/Volumes").join(&new_volumes[0]);
+    emit_log(app, job_id, tier,
+        &format!("✓ 已挂载 {}", mount.display()), false);
+
+    // cp -R · 把整个挂载内容复制到 dest
+    emit_log(app, job_id, tier, "▶ cp -R 复制 .app …", false);
+    let src_arg = format!("{}/", mount.display());
+    let cp_res = Command::new("cp")
+        .args(["-R"])
+        .arg(&src_arg)
+        .arg(dest)
+        .output().await;
+
+    // 不管 cp 成不成功 · 一定要 detach (防卡 mount)
+    let _ = Command::new("hdiutil")
+        .args(["detach"])
+        .arg(&mount)
+        .args(["-quiet", "-force"])
+        .output().await;
+
+    let cp_out = cp_res.map_err(|e| anyhow!("cp -R: {}", e))?;
+    if !cp_out.status.success() {
+        return Err(anyhow!("cp -R exit {}: {}",
+            cp_out.status, String::from_utf8_lossy(&cp_out.stderr)));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn extract_dmg(
+    _archive: &PathBuf, _dest: &PathBuf,
+    _app: &AppHandle, _job_id: &str, _tier: &str,
+) -> Result<()> {
+    Err(anyhow!("dmg 仅 macOS 支持"))
+}
+
+/// tar.xz 解压 (Linux · 用系统 tar -xJf · macOS/Win 也支持但我们用 dmg/zip)
+async fn extract_tar_xz(archive: &PathBuf, dest: &PathBuf) -> Result<()> {
+    let out = Command::new("tar")
+        .args(["-xJf"])
+        .arg(archive)
+        .args(["-C"])
+        .arg(dest)
+        .output().await
+        .map_err(|e| anyhow!("tar -xJf: {}", e))?;
+    if !out.status.success() {
+        return Err(anyhow!("tar exit {}: {}",
+            out.status, String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(())
 }

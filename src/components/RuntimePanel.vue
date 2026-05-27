@@ -33,8 +33,14 @@ function errorCategory(tier: string): { kind: string; advice: string } {
   const log = logsForTier(tier)
   if (!log || log.ok !== false) return { kind: "", advice: "" }
   const lines = log.lines.map((l) => l.line.toLowerCase()).join("\n")
+  if (/系统命令.*未找到|需要系统命令|仍未找到/.test(lines)) {
+    return { kind: "缺系统软件", advice: "自动安装未成功 · Mac 请先装 Homebrew · Win 请装后重试" }
+  }
+  if (/brew.*not found|homebrew/i.test(lines)) {
+    return { kind: "缺 Homebrew", advice: "终端运行: /bin/bash -c \"$(curl -fsSL https://brew.sh/install.sh)\"" }
+  }
   if (/timeout|timed out|connection reset|connection refused/.test(lines)) {
-    return { kind: "网络超时", advice: "试试切个镜像 · 或检查代理 / 防火墙" }
+    return { kind: "网络超时", advice: "网络不稳定 · 点重试自动切换镜像源" }
   }
   if (/ssl|certificate|tls/.test(lines)) {
     return { kind: "SSL/证书错", advice: "提示使用 trusted-host 跳主机验证" }
@@ -52,16 +58,50 @@ function errorCategory(tier: string): { kind: string; advice: string } {
 }
 
 /**
- * 生成该 tier × 镜像的手工 uv pip install 命令 · 可复制贴终端
+ * tier 分类: pip (有 packages) / binary (有 binaries) / system (有 system_commands) / unknown
+ */
+function tierKind(tier: string): "pip" | "binary" | "system" | "unknown" {
+  const spec = manifest.value?.tiers?.[tier]
+  if (!spec) return "unknown"
+  if (spec.packages && spec.packages.length > 0) return "pip"
+  if (spec.binaries && spec.binaries.length > 0) return "binary"
+  if (spec.system_commands && spec.system_commands.length > 0) return "system"
+  return "unknown"
+}
+
+/**
+ * 生成该 tier × 镜像的手工 uv 命令 · 可复制贴终端
+ * 仅对有 pip packages 的 tier 有效 · binary / system tier 返回空
+ * 按 manifest.platform 区分 Windows / macOS / Linux 生成对应格式
+ *
+ * 命令包含 2 步:
+ *   1. uv venv  (兜底: venv 不存在时创建 · 已存在则 idempotent)
+ *   2. uv pip install (实际安装)
+ *
+ * uv 用 --allow-insecure-host (官方标准) · 不用 pip 的 --trusted-host
  */
 function manualCmd(tier: string, mirror: { label: string; index_url: string; trusted_host?: string }): string {
   const spec = manifest.value?.tiers?.[tier]
   if (!spec) return ""
+  if (!spec.packages || spec.packages.length === 0) return ""
   const pkgs = spec.packages.join(" ")
-  const hostFlag = mirror.trusted_host ? `--trusted-host ${mirror.trusted_host} ` : ""
-  return `uv pip install --python ~/.qianshou/runtime/venvs/${tier}/bin/python \\
-  --index-url ${mirror.index_url} \\
-  ${hostFlag}${pkgs}`
+  const hostFlag = mirror.trusted_host ? `--allow-insecure-host ${mirror.trusted_host} ` : ""
+  // 优先用 preferred_versions[0] · 默认 3.11
+  const pyVer = manifest.value?.python?.preferred_versions?.[0] || "3.11"
+  const isWin = (manifest.value?.platform || "").startsWith("windows")
+
+  if (isWin) {
+    // PowerShell: $env:USERPROFILE 展开 · & 是调用运算符 · 多命令用 ; 分隔
+    const uvExe = "$env:USERPROFILE\\.qianshou\\runtime\\bin\\uv.exe"
+    const venvDir = `$env:USERPROFILE\\.qianshou\\runtime\\venvs\\${tier}`
+    const pyExe = `${venvDir}\\Scripts\\python.exe`
+    return `& "${uvExe}" venv "${venvDir}" --python ${pyVer} ; & "${uvExe}" pip install --python "${pyExe}" --index-url ${mirror.index_url} ${hostFlag}${pkgs}`
+  }
+  // macOS / Linux: ~/ 展开 · && 链式
+  const uvExe = "~/.qianshou/runtime/bin/uv"
+  const venvDir = `~/.qianshou/runtime/venvs/${tier}`
+  const pyExe = `${venvDir}/bin/python`
+  return `${uvExe} venv ${venvDir} --python ${pyVer} && ${uvExe} pip install --python ${pyExe} --index-url ${mirror.index_url} ${hostFlag}${pkgs}`
 }
 
 async function runRecheck(tier: string) {
@@ -177,6 +217,7 @@ async function refreshAll() {
           <div class="tc-title">
             {{ tierMetaOf(row.key).label }}
             <span v-if="row.spec.required" class="tc-req">必装</span>
+            <span v-if="row.spec.auto_install" class="tc-auto" title="客户端首次启动自动安装 · 无需手动点">自动</span>
           </div>
           <div class="tc-desc">{{ row.spec.description }}</div>
 
@@ -237,25 +278,52 @@ async function refreshAll() {
             <Icon name="status-failed" :size="13" />
             <span class="fb-kind">{{ errorCategory(row.key).kind }}</span>
             <span class="fb-advice">{{ errorCategory(row.key).advice }}</span>
+            <button class="fb-retry" @click="installTier(row.key)" :disabled="!!tierJob[row.key]">
+              {{ tierJob[row.key] ? '重试中…' : '⟳ 重试' }}
+            </button>
             <button class="fb-toggle" @click="manualOpen = manualOpen === row.key ? null : row.key">
-              {{ manualOpen === row.key ? "收起" : "手工安装…" }}
+              {{ manualOpen === row.key ? "收起" : "手动安装" }}
             </button>
           </div>
           <div v-if="manualOpen === row.key" class="fb-body">
-            <p class="fb-tip">
-              自动装失败了·可以抷下面某个镜像的命令贴到终端·装完点
-              <strong>"重新检测"</strong>让客户端接手。
-            </p>
-            <div
-              v-for="(mir, mi) in manifest?.mirrors ?? []" :key="mir.index_url"
-              class="fb-mirror"
-            >
-              <div class="fb-mirror-head">
-                <span class="fb-mirror-label">{{ mi + 1 }}· {{ mir.label }}</span>
-                <button class="fb-copy" @click="copyText(manualCmd(row.key, mir))">复制</button>
+            <!-- pip tier: 显示镜像源手动命令 -->
+            <template v-if="tierKind(row.key) === 'pip'">
+              <p class="fb-tip">
+                如果重试仍失败，可复制下面命令到终端执行，装完点
+                <strong>"重新检测"</strong>让客户端接手。
+              </p>
+              <div
+                v-for="(mir, mi) in manifest?.mirrors ?? []" :key="mir.index_url"
+                class="fb-mirror"
+              >
+                <div class="fb-mirror-head">
+                  <span class="fb-mirror-label">{{ mi + 1 }}· {{ mir.label }}</span>
+                  <button class="fb-copy" @click="copyText(manualCmd(row.key, mir))">复制</button>
+                </div>
+                <pre class="fb-cmd">{{ manualCmd(row.key, mir) }}</pre>
               </div>
-              <pre class="fb-cmd">{{ manualCmd(row.key, mir) }}</pre>
-            </div>
+            </template>
+            <!-- binary tier (ffmpeg 等): 直接下载二进制 · 无需手动 pip -->
+            <template v-else-if="tierKind(row.key) === 'binary'">
+              <p class="fb-tip">
+                此能力包为静态二进制下载 (非 pip 安装)。
+                请检查网络连接后点击上方 <strong>"重试"</strong> 按钮重新下载。
+                如果反复失败请检查防火墙或代理设置。
+              </p>
+            </template>
+            <!-- system tier (blender 等): 需要系统软件 -->
+            <template v-else-if="tierKind(row.key) === 'system'">
+              <p class="fb-tip">
+                此能力需要安装系统软件 (如 Blender)。
+                <strong>Mac</strong>: 打开终端运行 <code>brew install --cask blender</code><br/>
+                <strong>Windows</strong>: 从官网下载安装 <a href="https://www.blender.org/download/" target="_blank">blender.org</a><br/>
+                安装完成后点 <strong>"重新检测"</strong>。
+              </p>
+            </template>
+            <!-- 通用 -->
+            <template v-else>
+              <p class="fb-tip">请检查网络后点击上方 <strong>"重试"</strong> 按钮。</p>
+            </template>
             <div class="fb-actions">
               <button
                 class="tc-btn primary"
@@ -412,6 +480,15 @@ async function refreshAll() {
   color: var(--c-fg);
   letter-spacing: -0.01em;
 }
+.tc-auto {
+  font-size: var(--fs-2xs);
+  padding: 1px 6px;
+  background: var(--c-ok, #3fb950);
+  color: #fff;
+  border-radius: var(--r-xs);
+  font-weight: var(--fw-bold);
+  margin-left: 4px;
+}
 .tc-req {
   font-size: var(--fs-2xs);
   padding: 1px 6px;
@@ -563,17 +640,30 @@ async function refreshAll() {
   flex: 1;
   color: var(--c-fg-soft);
 }
+.fb-retry {
+  background: var(--c-brand);
+  border: 1px solid var(--c-brand);
+  color: #fff;
+  padding: 3px 12px;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-semibold);
+  cursor: pointer;
+  transition: all var(--dur-base);
+}
+.fb-retry:hover:not(:disabled) { background: var(--c-brand-2); }
+.fb-retry:disabled { opacity: 0.6; cursor: not-allowed; }
 .fb-toggle {
   background: transparent;
-  border: 1px solid var(--c-warn);
-  color: var(--c-warn);
+  border: 1px solid var(--c-line-strong);
+  color: var(--c-mute);
   padding: 3px 10px;
   border-radius: var(--r-pill);
   font-size: var(--fs-2xs);
   font-weight: var(--fw-medium);
   cursor: pointer;
 }
-.fb-toggle:hover { background: var(--c-warn); color: #fff; }
+.fb-toggle:hover { background: var(--c-bg-soft); color: var(--c-fg); }
 
 .fb-body {
   padding: 0 var(--sp-4) var(--sp-4);

@@ -169,6 +169,13 @@ pub struct ShardAssignPayload {
     pub requester_avatar: String,
     #[serde(default)]
     pub created_at_ms: i64,
+    // 2026-05-27 V8.1 · 客户端 venv 路由 (后端 v8.1+ 才发 · 老后端没此字段 · serde default 取空)
+    // executor 用 required_tier 选 venvs/<tier>/bin/python 跑脚本
+    // fallback_tiers 是兜底列表 (主 tier 没装时按顺序 try)
+    #[serde(default)]
+    pub required_tier: String,
+    #[serde(default)]
+    pub fallback_tiers: Vec<String>,
 }
 
 fn default_input_kind() -> String { "single_file".into() }

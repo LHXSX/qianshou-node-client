@@ -93,6 +93,9 @@ fn default_python_rel() -> String {
 pub struct TierSpec {
     #[serde(default)]
     pub required: bool,
+    /// V8.1 · 客户端首次启动自动装此 tier · 不需用户点 · 老后端不发此字段 = false
+    #[serde(default)]
+    pub auto_install: bool,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -128,6 +131,34 @@ pub struct TierSpec {
     /// None = 后端没烘焙这个 tier · 走老路径 pip install
     #[serde(default)]
     pub prebuilt_venv: Option<PrebuiltVenvSpec>,
+    /// V8.1 (2026-05-27) · 系统二进制 (如 blender) 各平台直下 URL · 绕开 brew/winget/sudo
+    /// 格式: { "macos-arm64": { url, kind, binary, exposes, mirrors[], size_mb } }
+    /// 老后端不发此字段 = 空 map · 客户端 fallback 到 install_hint (老路径)
+    #[serde(default)]
+    pub system_binaries: std::collections::BTreeMap<String, SystemBinarySpec>,
+}
+
+/// V8.1 (2026-05-27) · 单平台系统二进制下载规范 · 绕开 brew/winget
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SystemBinarySpec {
+    /// 主下载 URL (官方源)
+    pub url: String,
+    /// 镜像 URL 列表 · 主源失败按顺序 fallback (国内镜像优先后端按 region 重排)
+    #[serde(default)]
+    pub mirrors: Vec<String>,
+    /// 包格式 · "dmg" | "zip" | "tarxz" | "targz"
+    pub kind: String,
+    /// 解压后 binary 相对路径 · 例: "Blender.app/Contents/MacOS/Blender"
+    pub binary: String,
+    /// 暴露给系统 PATH 的命令名 · 例: "blender" / "blender.exe"
+    #[serde(default)]
+    pub exposes: String,
+    /// 预估大小 MB (UI 进度展示)
+    #[serde(default)]
+    pub size_mb: u32,
+    /// 可选 sha256 (留空跳过校验)
+    #[serde(default)]
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -169,8 +200,10 @@ pub fn detect_platform() -> (String, String) {
 /// 从后端拉 manifest
 pub async fn fetch() -> Result<RuntimeManifest> {
     let (os, arch) = detect_platform();
+    // 2026-05-27 · region=auto · 服务端按请求 IP 自动判断 cn/intl · 给镜像源排序
+    // 海外用户先试 pypi.org · 国内先试阿里云 · 避免错排导致 3 × 180s 超时
     let url = format!(
-        "{}/api/v8/runtime/manifest?os={}&arch={}",
+        "{}/api/v8/runtime/manifest?os={}&arch={}&region=auto",
         api_base(),
         os,
         arch

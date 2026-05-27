@@ -226,6 +226,33 @@ async fn run_v8_session(state: &Arc<AppState>, app: &AppHandle, token: &str) -> 
                     // uptime_sec · 服务端 heartbeat.py 会合入 capabilities · rep_stability 子分用
                     // (其他原扩展字段 cpu_usage/mem_usage/restart_count/pending_queue 服务端不消费 · 删)
                     extra.insert("uptime_sec".into(), json!(rt.uptime_sec));
+
+                    // 2026-05-27 · 同步运行时能力快照 (装/卸 tier 后 · 后端 15s 内感知)
+                    // 不必每次都读 installed.json · 但开销小 (< 5KB 文件) · 跟其他 hb 操作比可忽略
+                    // 旧版后端不消费这些 key (heartbeat.py 白名单外) · 向后兼容
+                    let installed = crate::runtime::detector::read_installed_meta();
+                    let mut sw_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                    let mut tier_names: Vec<String> = Vec::new();
+                    for (tname, t) in installed.tiers.iter() {
+                        if !t.ok { continue; }
+                        tier_names.push(tname.clone());
+                        for s in &t.software {
+                            sw_set.insert(s.clone());
+                        }
+                    }
+                    if !sw_set.is_empty() {
+                        extra.insert("software".into(), json!(sw_set.into_iter().collect::<Vec<_>>()));
+                    }
+                    if !tier_names.is_empty() {
+                        extra.insert("runtime_tiers".into(), json!(tier_names));
+                    }
+                    if !installed.install_mode.is_empty() {
+                        extra.insert("runtime_install_mode".into(), json!(installed.install_mode));
+                    }
+                    if let Some(hp) = installed.host_python.as_ref() {
+                        extra.insert("runtime_host_python".into(), json!(hp));
+                    }
+
                     let hb = OutFrame::new("hb", HbPayload {
                         load: rt.load_rate,
                         active_shards: active,
@@ -634,6 +661,9 @@ fn shard_to_task_assign(shard: &ShardAssignPayload) -> TaskAssign {
         tools: shard.params.get("tools").cloned(),
         output_schema: shard.params.get("output_schema").cloned(),
         skill_pack_id: shard.params.get("skill_pack_id").and_then(|v| v.as_str().map(String::from)),
+        // V8.1 · 透传后端发的 venv 路由字段 · executor.rs 用这两个选 venvs/<tier>/bin/python
+        required_tier: shard.required_tier.clone(),
+        fallback_tiers: shard.fallback_tiers.clone(),
     }
 }
 

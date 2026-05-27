@@ -258,6 +258,22 @@ fn current_throttle_level() -> ThrottleLevel {
     super::resource_limit::current_level()
 }
 
+/// V8.1 (2026-05-27) · 按 task.required_tier 选 venv 跑 Python 脚本
+/// 委托给 paths::pick_python_with_hint · 跟 tool_caller.rs 共用同一套路由
+fn pick_python_for_task(task: &TaskAssign, _runtime: &str) -> (String, Vec<std::path::PathBuf>) {
+    let rt_hint = if task.required_tier.is_empty() {
+        None
+    } else {
+        Some(task.required_tier.as_str())
+    };
+    let (py, pp) = crate::runtime::paths::pick_python_with_hint(rt_hint, &task.fallback_tiers);
+    tracing::info!(
+        "executor · python 路由 → {} (required_tier={:?} fb={:?})",
+        py, task.required_tier, task.fallback_tiers
+    );
+    (py, pp)
+}
+
 /// M3.6 script 模式：拉 code_url → 写到临时文件 → 用 runtime 执行
 async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<(String, i32)> {
     let runtime = if task.runtime.is_empty() {
@@ -491,19 +507,20 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<(String, i32
 
     // 4. 构造 command：runtime <script> <cmd_extra...>
     //
-    // 2026-05-23 · 优先用内置预烘焙 Python (cpython python3.11)
-    // 这样新装客户端的用户不用本机预装 Python 也能跑 image_resize 等任务
+    // V8.1 (2026-05-27) · 按 task.required_tier 路由到对应 venv
     //
-    // 实现:
-    //   - bundled_runtime_for(&["image","base"]) → (python_bin, PYTHONPATH 列表)
-    //   - 注意不能用 envs/*/bin/python (Tauri bundle 会 deref symlink · venv 失效 · 找不到 stdlib)
-    //   - 改用 cpython 真二进制 + PYTHONPATH 喂 envs/*/lib/site-packages
+    // 路由优先级 (高 → 低):
+    //   1. task.required_tier (后端 v8.1+ 发) → venvs/<tier>/bin/python
+    //   2. task.fallback_tiers · 按顺序 try → venvs/<tier>/bin/python
+    //   3. venvs/lite (auto-install · 大概率装好) → venvs/lite/bin/python
+    //   4. 老路径: bundled_runtime_for(["image","base"]) (旧客户端打包内置 cpython)
+    //   5. 最终兜底: 系统 python3
+    //
+    // 老后端 (v8.0.x) 不发 required_tier · serde 取空 · 直接进 step 3 (venvs/lite)
+    // 新客户端首次启动会自动装 lite · 所以 step 3 几乎一定命中
     let (runtime_bin, bundled_pythonpath): (String, Vec<std::path::PathBuf>) =
         if runtime == "python3" || runtime == "python" {
-            match crate::runtime::paths::bundled_runtime_for(&["image", "base"]) {
-                Some((p, paths)) => (p.to_string_lossy().into_owned(), paths),
-                None => (runtime.clone(), Vec::new()),
-            }
+            pick_python_for_task(task, &runtime)
         } else {
             (runtime.clone(), Vec::new())
         };

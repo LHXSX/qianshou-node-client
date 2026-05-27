@@ -191,6 +191,11 @@ pub fn run() {
                     tracing::warn!("bootstrap_bundled 失败: {} (走老 uv install 路径)", e);
                 }
             });
+
+            // V8.1 (2026-05-27) · 首启自动装 manifest.tiers 标 auto_install=true 的 tier
+            // 当前: 仅 lite (基础包 pillow numpy 等) · executor 路由的兜底 venv
+            // 老后端不发 auto_install 字段 = false · 此函数等于 no-op (兼容)
+            runtime::auto_install_tiers::spawn_auto_install(app.handle().clone());
             // M3.3：系统托盘（菜单 + 关闭主窗口最小化到托盘）
             let show_item = MenuItem::with_id(app, "show", "打开主面板", true, None::<&str>)?;
             let pause_item = MenuItem::with_id(app, "pause", "暂停贡献", true, None::<&str>)?;

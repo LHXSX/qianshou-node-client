@@ -70,6 +70,16 @@ pub fn logs_dir() -> PathBuf {
     runtime_root().join("logs")
 }
 
+/// V8.1 (2026-05-27) · 直下系统二进制总目录 (如 blender · 绕开 brew/winget)
+/// 例:
+///   ~/.qianshou/runtime/system_bin/render/
+///       Blender.app/Contents/MacOS/Blender  (macOS dmg 解出)
+///       blender-4.2.0-windows-x64/blender.exe  (Win zip 解出)
+///       blender-4.2.0-linux-x64/blender  (Linux tarxz 解出)
+pub fn system_bin_root(tier: &str) -> PathBuf {
+    runtime_root().join("system_bin").join(sanitize_tier(tier))
+}
+
 /// uv 二进制缓存目录 (从 bundled resource 拷贝过来 · 或 HTTP 下载)
 pub fn uv_bin_dir() -> PathBuf {
     runtime_root().join("bin")
@@ -223,6 +233,59 @@ fn dirs_home() -> Option<PathBuf> {
     {
         std::env::var_os("HOME").map(PathBuf::from)
     }
+}
+
+/// V8.1 (2026-05-27) · 通用 python 路由 · executor + tool_caller 共用
+///
+/// 返回 (python_bin, bundled_pythonpath)
+///   - python_bin: 绝对路径或命令名
+///   - bundled_pythonpath: 老路径 fallback 时塞 PYTHONPATH 的目录列表 (新路径走 venv 自带 site-packages · 列表为空)
+///
+/// 路由优先级 (高 → 低):
+///   1. required_tier (调用方指定 · 如 task.required_tier)
+///   2. fallback_tiers 按顺序 try
+///   3. venvs/lite (auto-install · 大概率装好)
+///   4. 老路径: bundled_runtime_for(["image","base"])
+///   5. 最终兜底: 系统 python3
+///
+/// 双端: venv_python(tier) 已 cfg(windows) 区分 bin/python vs Scripts/python.exe
+pub fn pick_python_with_hint(
+    required_tier: Option<&str>,
+    fallback_tiers: &[String],
+) -> (String, Vec<PathBuf>) {
+    // 收集要试的 tier 列表
+    let mut try_tiers: Vec<String> = Vec::new();
+    if let Some(rt) = required_tier {
+        if !rt.is_empty() {
+            try_tiers.push(rt.to_string());
+        }
+    }
+    for fb in fallback_tiers {
+        if !fb.is_empty() && !try_tiers.contains(fb) {
+            try_tiers.push(fb.clone());
+        }
+    }
+    // 兜底 lite (auto_install)
+    let lite = "lite".to_string();
+    if !try_tiers.contains(&lite) {
+        try_tiers.push(lite);
+    }
+
+    // 按顺序试 venvs/<tier>/bin/python (Win: Scripts/python.exe)
+    for tier in &try_tiers {
+        let py = venv_python(tier);
+        if py.exists() {
+            return (py.to_string_lossy().into_owned(), Vec::new());
+        }
+    }
+
+    // 老路径兜底 (8.0.x 升 8.1.0 · cpython + envs 还在)
+    if let Some((p, pp)) = bundled_runtime_for(&["image", "base"]) {
+        return (p.to_string_lossy().into_owned(), pp);
+    }
+
+    // 最终兜底: 系统 python3
+    ("python3".to_string(), Vec::new())
 }
 
 #[cfg(test)]
