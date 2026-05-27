@@ -28,7 +28,7 @@ git add . --dry-run | head -30
 
 # 真 add + commit
 git add .
-git commit -m "init: tauri 2 client v8.0.17 + CI workflow"
+git commit -m "init: tauri 2 client v8.1.0 + CI workflow"
 
 # 关联你的 GitHub repo (把 YOUR-USERNAME 换成你的 GH 用户名)
 git remote add origin https://github.com/YOUR-USERNAME/qianshou-node-client.git
@@ -63,8 +63,8 @@ cat /Users/pangdundun/算力/client-v3-latest/.tauri-keys-2026/qianshou-2026.key
 
 或者 push 一个 tag (推荐 · 自动出 release):
 ```bash
-git tag v8.0.17
-git push origin v8.0.17
+git tag v8.1.0
+git push origin v8.1.0
 ```
 
 → 等 5-10 分钟 · GH Actions 会自动 build mac+win+linux · 全部签名 · 上传到 Releases.
@@ -75,12 +75,12 @@ git push origin v8.0.17
 
 打开 repo → **Releases** 看新版本:
 ```
-qianshou-node-v8.0.17 (draft)
-├─ 千手节点_8.0.17_aarch64.dmg               (macOS Apple Silicon)
-├─ 千手节点_8.0.17_x64.dmg                    (macOS Intel)
-├─ 千手节点_8.0.17_x64-setup.exe              (Windows 安装包)
-├─ 千手节点_8.0.17_x64-setup.nsis.zip         (Windows OTA)
-├─ 千手节点_8.0.17_x64-setup.nsis.zip.sig     (Windows OTA 签名)
+qianshou-node-v8.1.0 (draft)
+├─ 千手节点_8.1.0_aarch64.dmg                (macOS Apple Silicon)
+├─ 千手节点_8.1.0_x64.dmg                     (macOS Intel)
+├─ 千手节点_8.1.0_x64-setup.exe               (Windows 安装包)
+├─ 千手节点_8.1.0_x64-setup.nsis.zip          (Windows OTA)
+├─ 千手节点_8.1.0_x64-setup.nsis.zip.sig      (Windows OTA 签名)
 ├─ 千手节点.app.tar.gz                         (macOS OTA)
 └─ 千手节点.app.tar.gz.sig                     (macOS OTA 签名)
 ```
@@ -94,12 +94,12 @@ qianshou-node-v8.0.17 (draft)
 ```bash
 # 1 · 改代码 → 改版本号 (tauri.conf.json + Cargo.toml + package.json) → commit
 git add .
-git commit -m "feat: 8.0.18 - 某某修复"
+git commit -m "feat: 8.1.0 - 某某修复"
 
 # 2 · 打 tag → push → 自动 build → 自动出 Release
-git tag v8.0.18
+git tag v8.1.0
 git push origin main
-git push origin v8.0.18
+git push origin v8.1.0
 
 # 3 · 等 5-10 分钟 → GH Releases 自动出新版 → 复制 URL 配后端 OTA
 ```
@@ -128,7 +128,7 @@ git push origin v8.0.18
 | Windows build 报 `link.exe` not found | runner 自带 · 不会出 (除非你乱改 yml) |
 | build 卡 8 分钟以上 | 第一次正常 · 后续有 rust-cache 加速到 3-5 分钟 |
 | 私钥不小心 push 上去了 | 立刻 GitHub → Settings → Delete repo → 重做 + 重生新 key + 改 binary.json |
-| GH Releases 没出现 | tag 没 push (`git push origin v8.0.17`) · 或 workflow 失败看 Actions tab 日志 |
+| GH Releases 没出现 | tag 没 push (`git push origin v8.1.0`) · 或 workflow 失败看 Actions tab 日志 |
 | 私有 repo 每月 2000 min 用完 | 改为 public repo (公开无限) 或买 GitHub Pro ($4/月) |
 
 ---
