@@ -15,7 +15,26 @@ on:
       - 'v*'
 
 jobs:
+  # 0 · 每次 CI 跑之前清掉同名 stale draft release · 避免 tauri-action 上传时
+  #     "ReleaseAsset already_exists" (重跑 / 重新打 tag 场景常见)
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: delete stale release (if exists)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag push · 清旧 release ${{ github.ref_name }}"
+            gh release delete "${{ github.ref_name }}" --yes --cleanup-tag=false -R ${{ github.repository }} 2>&1 || echo "(无旧 release · 继续)"
+          else
+            echo "非 tag push · 跳过"
+          fi
+
   build-tauri:
+    needs: prepare-release
     permissions:
       contents: write   # 允许 release 写入
     strategy:
@@ -114,6 +133,7 @@ jobs:
             src-tauri/target/**/release/bundle/macos/*.app.tar.gz
             src-tauri/target/**/release/bundle/macos/*.app.tar.gz.sig
             src-tauri/target/**/release/bundle/nsis/*.exe
+            src-tauri/target/**/release/bundle/nsis/*.exe.sig
             src-tauri/target/**/release/bundle/nsis/*.nsis.zip
             src-tauri/target/**/release/bundle/nsis/*.nsis.zip.sig
             src-tauri/target/**/release/bundle/deb/*.deb
