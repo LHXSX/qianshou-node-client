@@ -105,6 +105,10 @@ pub struct TierSpec {
     /// Python 自检脚本 · 一行 `import xxx; print('ok')` 之类
     #[serde(default)]
     pub smoke_test: String,
+    /// 2026-05-29 v8.1.4 · 单 tier 自检超时秒数 · 0/未设 → 走默认 60s
+    /// 大包如 paddleocr/paddlepaddle 首次 import 要初始化 + 可能下模型 · 需 180-300s
+    #[serde(default)]
+    pub smoke_timeout_secs: u64,
     /// 暴露给调度器的 software 标识 · planner.py 用这个匹配
     #[serde(default)]
     pub software: Vec<String>,

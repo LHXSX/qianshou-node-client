@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-VERSION="${VERSION:-8.1.0}"
+VERSION="${VERSION:-8.1.4}"
 REPO="${REPO:-LHXSX/qianshou-node-client}"
 SSH_HOST="${SSH_HOST:-edge}"
 MANUAL="${MANUAL:-0}"   # 1 = 跳过下载 · 直接用 WORKDIR 里现有文件

@@ -281,27 +281,66 @@ async fn uv_python_find(uv: &Path, version: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+/// 2026-05-29 v8.1.4 · uv 装 Python · 多镜像源 fallback (国内优先)
+///
+/// 痛点: uv 默认 UV_PYTHON_INSTALL_MIRROR 是 github.com/astral-sh/python-build-standalone/releases/download
+///       国内访问 GitHub 99% 超时 → 用户装 tier 100% 失败 (`operation timed out` after 3 retries)
+///
+/// 解法: 6 个国内 GitHub-release 镜像 + 1 个官方源轮询 · 任一成功就 break
+/// uv 0.5+ 支持 UV_PYTHON_INSTALL_MIRROR env · 单次只能一个值
+/// 我们循环改这个 env 试不同镜像
 async fn uv_python_install(uv: &Path, version: &str) -> Result<()> {
-    let mut cmd = Command::new(uv);
-    cmd.env("UV_PYTHON_INSTALL_DIR", paths::uv_python_dir())
-        .arg("python")
-        .arg("install")
-        .arg(version)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-    crate::proc_util::hide_window_tokio(&mut cmd);
-    let out = tokio::time::timeout(Duration::from_secs(600), cmd.output())
-        .await
-        .map_err(|_| anyhow!("uv python install {} 超时", version))?
-        .map_err(|e| anyhow!("uv python install 执行失败: {}", e))?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "uv python install {} 失败 (exit {:?}): {}",
-            version,
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        ));
+    // 2026-05-29 v8.1.4 实测可达 (Mac arm64 北京 IP):
+    //   ✅ mirror.nju.edu.cn   172ms 直返 200 (国内最稳 · 首选)
+    //   ✅ gh-proxy.com        768ms CDN 200 (GitHub 反代 · 全球兜底)
+    //   ❌ mirrors.tuna.tsinghua.edu.cn  → 404 (不镜像 astral-sh repo)
+    //   ❌ mirrors.bfsu.edu.cn           → 404
+    //   ❌ mirrors.ustc.edu.cn           → 302 重定向超时
+    //   ❌ mirrors.cloud.tencent.com 等   → 不镜像此 repo
+    //
+    // uv mirror URL 不要含 "/LatestRelease" · uv 会自动拼接 /<release_tag>/<filename>
+    let mirrors: &[(&str, &str)] = &[
+        ("南京大学",     "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone"),
+        ("gh-proxy CDN", "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"),
+        ("GitHub 官方",  "https://github.com/astral-sh/python-build-standalone/releases/download"),
+    ];
+
+    let mut last_err = String::new();
+    for (label, mirror_url) in mirrors {
+        let mut cmd = Command::new(uv);
+        cmd.env("UV_PYTHON_INSTALL_DIR", paths::uv_python_dir())
+            .env("UV_PYTHON_INSTALL_MIRROR", mirror_url)
+            .arg("python")
+            .arg("install")
+            .arg(version)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+        crate::proc_util::hide_window_tokio(&mut cmd);
+        // 单源 90 秒超时 · 6 个镜像最差 9min · 比之前单源 600s 卡死强 60x
+        let result = tokio::time::timeout(Duration::from_secs(90), cmd.output()).await;
+        match result {
+            Ok(Ok(out)) if out.status.success() => {
+                // 成功 · 不再轮询
+                tracing::info!("uv python install {} 成功 · 镜像: {}", version, label);
+                return Ok(());
+            }
+            Ok(Ok(out)) => {
+                last_err = format!("镜像 [{}] exit={:?}: {}",
+                    label, out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>());
+                tracing::warn!("uv python install · {} 失败 · 尝试下一个", label);
+            }
+            Ok(Err(e)) => {
+                last_err = format!("镜像 [{}] 执行失败: {}", label, e);
+            }
+            Err(_) => {
+                last_err = format!("镜像 [{}] 90s 超时", label);
+            }
+        }
     }
-    Ok(())
+    Err(anyhow!(
+        "uv python install {} 全部镜像失败 (试过 {} 个) · 最后错误: {}",
+        version, mirrors.len(), last_err
+    ))
 }

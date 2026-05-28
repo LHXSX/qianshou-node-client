@@ -20,11 +20,37 @@ const {
   installTier, uninstallTier, recheckTier, statusOf, logsForTier, tierJob,
 } = useRuntime()
 
-import { ref as vueRef } from "vue"
+import { ref as vueRef, computed as vueComputed } from "vue"
 // 打开 "手工安装" 面板的 tier (空 = 不显示)
 const manualOpen = vueRef<string | null>(null)
 const rechecking = vueRef<Record<string, boolean>>({})
 const recheckMsg = vueRef<Record<string, string>>({})
+// 2026-05-29 v8.1.4 · 失败时日志默认折叠 · 用户点 "查看完整日志" 才展开
+// 避免 80 行 pip 装包日志把失败提示 + 重试按钮挤到屏幕外
+const logExpanded = vueRef<Record<string, boolean>>({})
+function toggleLog(tier: string) { logExpanded.value[tier] = !logExpanded.value[tier] }
+
+// 失败时提取最后一行 stderr 作为错误摘要 (1 行内) · 显示在最显眼位置
+function failSummary(tier: string): string {
+  const log = logsForTier(tier)
+  if (!log || log.ok !== false) return ""
+  // 优先用 error_msg (后端 emit 的 error 字段)
+  if (log.error_msg) return log.error_msg.split("\n")[0].slice(0, 200)
+  // 否则倒序找第一条 err 行
+  for (let i = log.lines.length - 1; i >= 0; i--) {
+    if (log.lines[i].err) return log.lines[i].line.slice(0, 200)
+  }
+  return log.lines.length > 0 ? log.lines[log.lines.length - 1].line.slice(0, 200) : "(无日志)"
+}
+
+async function copyErrorReport(tier: string) {
+  const log = logsForTier(tier)
+  if (!log) return
+  // 完整错误报告 · 含 tier 名 + 平台 + 最后 30 行日志
+  const lines = log.lines.slice(-30).map(l => (l.err ? "✗ " : "  ") + l.line).join("\n")
+  const report = `[千手节点 v8.1.4 · tier=${tier} 安装失败]\n\n${lines}`
+  await copyText(report)
+}
 
 /**
  * 错误分类 · 从日志粗判原因
@@ -256,35 +282,57 @@ async function refreshAll() {
           </button>
         </div>
 
-        <!-- 安装日志 -->
+        <!-- 2026-05-29 v8.1.4 · 失败时优先显示错误总结 (不让 80 行 pip 日志挤掉重点) -->
+        <div
+          v-if="logsForTier(row.key) && logsForTier(row.key)!.ok === false && !logsForTier(row.key)!.running"
+          class="tc-fail-summary"
+        >
+          <div class="fs-icon">✗</div>
+          <div class="fs-body">
+            <div class="fs-title">
+              <span class="fs-kind">{{ errorCategory(row.key).kind || '安装失败' }}</span>
+              <span class="fs-advice">{{ errorCategory(row.key).advice }}</span>
+            </div>
+            <div class="fs-msg" :title="failSummary(row.key)">{{ failSummary(row.key) }}</div>
+          </div>
+          <div class="fs-actions">
+            <button class="fs-btn primary" @click="installTier(row.key)" :disabled="!!tierJob[row.key]">
+              {{ tierJob[row.key] ? '重试中…' : '⟳ 重试' }}
+            </button>
+            <button class="fs-btn" @click="copyErrorReport(row.key)" title="复制完整报错">复制</button>
+            <button class="fs-btn" @click="manualOpen = manualOpen === row.key ? null : row.key">
+              {{ manualOpen === row.key ? '收起' : '手动装' }}
+            </button>
+          </div>
+        </div>
+
+        <!-- 安装日志 · 运行中/成功 自动展开 · 失败时默认折叠 (点击展开) -->
         <div v-if="logsForTier(row.key)" class="tc-log">
-          <div class="tc-log-head">
-            <span>实时日志</span>
+          <div class="tc-log-head" @click="toggleLog(row.key)" :class="{ clickable: logsForTier(row.key)!.ok === false }">
+            <span class="log-label">
+              <template v-if="logsForTier(row.key)!.ok === false && !logsForTier(row.key)!.running">
+                {{ logExpanded[row.key] ? '▼' : '▶' }} 完整日志 ({{ logsForTier(row.key)!.lines.length }} 行)
+              </template>
+              <template v-else>实时日志</template>
+            </span>
             <span :class="{ ok: logsForTier(row.key)!.ok, fail: logsForTier(row.key)!.ok === false && !logsForTier(row.key)!.running, running: logsForTier(row.key)!.running }">
               {{ logsForTier(row.key)!.running ? "运行中…" : (logsForTier(row.key)!.ok ? "✓ 完成" : "✗ 失败") }}
             </span>
           </div>
-          <div class="tc-log-body">
+          <!-- 失败时默认折 · 运行中/成功 自动展 -->
+          <div
+            v-if="logsForTier(row.key)!.running || logsForTier(row.key)!.ok === true || logExpanded[row.key]"
+            class="tc-log-body"
+          >
             <div v-for="(l, i) in logsForTier(row.key)!.lines.slice(-80)" :key="i" :class="{ err: l.err }">{{ l.line }}</div>
           </div>
         </div>
 
-        <!-- 2026-05-26 · 安装失败 → 手工安装引导 · 仿 Ollama/Steam 错误产材 -->
+        <!-- 2026-05-26 · 手工安装详细面板 (默认折 · 点 "手动装" 才展) -->
         <div
-          v-if="logsForTier(row.key) && logsForTier(row.key)!.ok === false && !logsForTier(row.key)!.running"
+          v-if="logsForTier(row.key) && logsForTier(row.key)!.ok === false && !logsForTier(row.key)!.running && manualOpen === row.key"
           class="tc-fallback"
         >
-          <div class="fb-head">
-            <Icon name="status-failed" :size="13" />
-            <span class="fb-kind">{{ errorCategory(row.key).kind }}</span>
-            <span class="fb-advice">{{ errorCategory(row.key).advice }}</span>
-            <button class="fb-retry" @click="installTier(row.key)" :disabled="!!tierJob[row.key]">
-              {{ tierJob[row.key] ? '重试中…' : '⟳ 重试' }}
-            </button>
-            <button class="fb-toggle" @click="manualOpen = manualOpen === row.key ? null : row.key">
-              {{ manualOpen === row.key ? "收起" : "手动安装" }}
-            </button>
-          </div>
           <div v-if="manualOpen === row.key" class="fb-body">
             <!-- pip tier: 显示镜像源手动命令 -->
             <template v-if="tierKind(row.key) === 'pip'">

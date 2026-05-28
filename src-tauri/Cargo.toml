@@ -1,6 +1,6 @@
 [package]
 name = "qianshou-client"
-version = "8.1.3"
+version = "8.1.4"
 description = "千手 · EdgeCompute 边缘算力桌面客户端"
 authors = ["EdgeCompute Team"]
 edition = "2021"

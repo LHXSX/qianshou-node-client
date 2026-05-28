@@ -54,6 +54,32 @@ fn read_stored_platform(manifest_path: &Path) -> String {
         .to_string()
 }
 
+/// 2026-05-28 v8.1.3 · 归一化 platform label · 兼容老 8.0.x 用 Python triple
+/// 历史标签:
+///   8.0.x 老 prebake.sh 写: "aarch64-apple-darwin" / "x86_64-apple-darwin" /
+///                          "x86_64-pc-windows-msvc-shared" / "x86_64-pc-windows-msvc"
+///   8.1.x 新 prebake.sh 写: "macos-aarch64" / "macos-x86_64" / "windows-x86_64"
+///   8.0.x detector schema:  "macos-arm64" / "macos-x86_64" / "windows-x86_64"
+/// 全部归一到 8.1.x 短名格式
+fn normalize_platform_label(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    match s {
+        // Python triple → 短名
+        "aarch64-apple-darwin" => "macos-aarch64".into(),
+        "x86_64-apple-darwin" => "macos-x86_64".into(),
+        "x86_64-pc-windows-msvc-shared"
+        | "x86_64-pc-windows-msvc" => "windows-x86_64".into(),
+        "x86_64-unknown-linux-gnu" => "linux-x86_64".into(),
+        // 历史 detector schema 短名 → 跟 current_platform_label() 对齐
+        "macos-arm64" => "macos-aarch64".into(),
+        // 已经是新短名 · 原样返
+        other => other.into(),
+    }
+}
+
 /// 首次启动入口 · 不抛错 (失败就让 installer 走老路径)
 ///
 /// 2026-05-28 · 加 platform mismatch 检测 ·
@@ -62,25 +88,49 @@ fn read_stored_platform(manifest_path: &Path) -> String {
 ///   - bundle 里 prebake 的是正确平台 · 但本地已存 manifest.json 平台不对
 ///   - 旧逻辑只看 marker 存在就跳 · 永远用错的 cpython 跑 → 所有 v2 task 失败
 ///   - 新逻辑: marker 平台不匹配 → 整个 dest 清空重做
+///
+/// 2026-05-28 v8.1.3 · 灾难级 bug 修复 ·
+///   - 8.0.x 老 prebake 写的 platform 是 "aarch64-apple-darwin" (Python triple)
+///   - current_platform_label() 是 "macos-aarch64" (短名)
+///   - 字符串直接 == 比较永远不匹配 → 触发 remove_dir_all(&dest)
+///   - 用户费时装好的 venvs/lite/ venvs/crawl/ 全删 → 升级一次重装一次
+///   - 修复 1: 走 normalize_platform_label 归一化后再比 (兼容历史所有格式)
+///   - 修复 2: 即使真的 mismatch (跨架构覆盖) · 也只重写 manifest.json · 不动 venvs/
+///            cpython 旧文件让 bundle copy_tree 覆盖即可 · venvs 是用户数据严禁动
 pub async fn ensure_bundled_runtime(app: &AppHandle) -> Result<()> {
     let dest = paths::runtime_root();
 
-    // 1. 已经 bootstrap 过 · 检查 platform 是否匹配
+    // 1. 已经 bootstrap 过 · 检查 platform 是否匹配 (归一化后比)
     let marker = dest.join("manifest.json");
     if marker.exists() {
-        let current = current_platform_label();
-        let stored = read_stored_platform(&marker);
+        let current = normalize_platform_label(current_platform_label());
+        let stored = normalize_platform_label(&read_stored_platform(&marker));
         if stored == current {
-            tracing::debug!("runtime/manifest.json 已存在且 platform={} 匹配 · 跳过 bundle bootstrap", current);
+            tracing::debug!(
+                "runtime/manifest.json 已存在且 platform={} 匹配 · 跳过 bundle bootstrap",
+                current
+            );
             return Ok(());
         }
         tracing::warn!(
-            "runtime/manifest.json platform 不匹配 (stored='{}' current='{}') · 删除重做",
+            "runtime/manifest.json platform 不匹配 (stored='{}' current='{}') · 仅覆盖 cpython · 保留 venvs/ 用户数据",
             stored, current
         );
-        // 删整个 dest · 让后续逻辑重新拷
-        if let Err(e) = std::fs::remove_dir_all(&dest) {
-            tracing::warn!("删除旧 runtime 失败: {} · 强行继续 (新文件覆盖老的)", e);
+        // 2026-05-28 修复: 不再 remove_dir_all(&dest) · 那会清光用户已装的 venvs/
+        // 只删平台相关的 cpython/ 让 bundle 重拷 · venvs 保持原样
+        // (用户 venv 用的是相对路径 python · cpython 换了不会破)
+        for sub in ["cpython", "bin", "manifest.json"] {
+            let p = dest.join(sub);
+            if p.exists() {
+                let r = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+                if let Err(e) = r {
+                    tracing::warn!("删除 {} 失败: {} · 继续 (copy_tree 会覆盖)", p.display(), e);
+                }
+            }
         }
     }
 
@@ -114,7 +164,9 @@ pub async fn ensure_bundled_runtime(app: &AppHandle) -> Result<()> {
         return Ok(());
     }
 
-    // 3. 拷
+    // 3. 拷 (2026-05-29 v8.1.4 · "装一次永久" 关键保护:
+    //         bundle 拷贝时 SKIP 用户已存在的 venv/* 子目录
+    //         OTA 升级 bundle 带新 lite/crawl venv · 不覆盖用户当前已装的)
     tracing::info!(
         "首次启动 · 拷贝预烘焙 runtime: {} → {}",
         src.display(),
@@ -123,10 +175,37 @@ pub async fn ensure_bundled_runtime(app: &AppHandle) -> Result<()> {
     let t0 = std::time::Instant::now();
     std::fs::create_dir_all(&dest)
         .map_err(|e| anyhow!("创建 {} 失败: {}", dest.display(), e))?;
-    copy_tree(&src, &dest)?;
+    // 列出用户已存在的 venvs/<tier> · 拷贝时跳过这些 · 保留用户已装的依赖
+    let preserve_venvs: std::collections::HashSet<String> = {
+        let mut s = std::collections::HashSet::new();
+        let venvs_dir = dest.join("venvs");
+        if venvs_dir.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&venvs_dir) {
+                for e in rd.flatten() {
+                    if e.path().is_dir() {
+                        // 只保留有 python 二进制的 venv (已装好的) · 半装空目录不保
+                        let py_path = if cfg!(target_os = "windows") {
+                            e.path().join("Scripts").join("python.exe")
+                        } else {
+                            e.path().join("bin").join("python")
+                        };
+                        if py_path.exists() {
+                            if let Some(name) = e.file_name().to_str() {
+                                s.insert(format!("venvs/{}", name));
+                                tracing::info!("preserve 用户已装 venv · 跳过 bundle 覆盖: venvs/{}", name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        s
+    };
+    copy_tree_with_skip(&src, &dest, "", &preserve_venvs)?;
     tracing::info!(
-        "✅ 预烘焙 runtime 就绪 · 耗时 {:.1}s",
-        t0.elapsed().as_secs_f64()
+        "✅ 预烘焙 runtime 就绪 · 耗时 {:.1}s · 保留 {} 个用户已装 venv",
+        t0.elapsed().as_secs_f64(),
+        preserve_venvs.len()
     );
 
     // 4. 写 installed.json (让 WS hello 上报 image tier 已就绪)
@@ -135,7 +214,95 @@ pub async fn ensure_bundled_runtime(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// 2026-05-29 v8.1.4 · 递归拷贝 · 支持跳过用户已装的子路径
+///
+/// rel_prefix: 当前递归层级的相对路径前缀 (从根算起 · 用 "/" 分隔 · 跟 skip set 元素格式对齐)
+/// skip: 跳过的相对路径集合 (如 {"venvs/lite", "venvs/crawl"})
+///
+/// 例: copy_tree_with_skip(bundle, dest, "", {"venvs/lite"})
+///   - 拷 bundle/cpython → dest/cpython
+///   - 拷 bundle/venvs → dest/venvs (进入子目录)
+///     - 跳 bundle/venvs/lite (rel="venvs/lite" 在 skip)
+///     - 拷 bundle/venvs/crawl → dest/venvs/crawl
+fn copy_tree_with_skip(
+    src: &Path,
+    dst: &Path,
+    rel_prefix: &str,
+    skip: &std::collections::HashSet<String>,
+) -> Result<()> {
+    if !src.exists() {
+        return Err(anyhow!("源不存在: {}", src.display()));
+    }
+    std::fs::create_dir_all(dst).ok();
+
+    for entry in std::fs::read_dir(src)
+        .map_err(|e| anyhow!("read_dir {}: {}", src.display(), e))?
+    {
+        let entry = entry.map_err(|e| anyhow!("read_dir entry: {}", e))?;
+        let src_p = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let cur_rel = if rel_prefix.is_empty() {
+            name_str.to_string()
+        } else {
+            format!("{}/{}", rel_prefix, name_str)
+        };
+
+        // 跳过用户已装的 venv (保护用户数据 · "装一次永久")
+        if skip.contains(&cur_rel) {
+            continue;
+        }
+
+        let dst_p = dst.join(&name);
+        let ft = entry
+            .file_type()
+            .map_err(|e| anyhow!("file_type {}: {}", src_p.display(), e))?;
+
+        if ft.is_symlink() {
+            let link_target = std::fs::read_link(&src_p)
+                .map_err(|e| anyhow!("read_link {}: {}", src_p.display(), e))?;
+            if dst_p.exists() || dst_p.is_symlink() {
+                let _ = std::fs::remove_file(&dst_p);
+            }
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&link_target, &dst_p)
+                    .map_err(|e| anyhow!("symlink {}: {}", dst_p.display(), e))?;
+            }
+            #[cfg(windows)]
+            {
+                let abs_target = if link_target.is_absolute() {
+                    link_target.clone()
+                } else {
+                    src_p.parent().unwrap_or(src).join(&link_target)
+                };
+                if abs_target.is_dir() {
+                    copy_tree_with_skip(&abs_target, &dst_p, &cur_rel, skip)?;
+                } else if abs_target.is_file() {
+                    std::fs::copy(&abs_target, &dst_p)
+                        .map_err(|e| anyhow!("copy {}: {}", dst_p.display(), e))?;
+                }
+            }
+        } else if ft.is_dir() {
+            copy_tree_with_skip(&src_p, &dst_p, &cur_rel, skip)?;
+        } else {
+            std::fs::copy(&src_p, &dst_p)
+                .map_err(|e| anyhow!("copy {} → {}: {}", src_p.display(), dst_p.display(), e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = entry.metadata() {
+                    let perm = meta.permissions();
+                    let _ = std::fs::set_permissions(&dst_p, perm);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 递归拷贝目录 · 保留 symlink (不 follow)
+#[allow(dead_code)]
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     if !src.exists() {
         return Err(anyhow!("源不存在: {}", src.display()));

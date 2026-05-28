@@ -30,7 +30,13 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 const PIP_TIMEOUT_SECS: u64 = 180; // 单源最长 3 分钟 (2026-05-27 改: 之前 600s · 6 个镜像最差 60min)
-const SMOKE_TIMEOUT_SECS: u64 = 30;
+const SMOKE_TIMEOUT_DEFAULT_SECS: u64 = 60; // 2026-05-29 v8.1.4 · 从 30s 拉到 60s · paddleocr 重 tier 首次 import 30s 不够
+
+/// 取 tier 实际 smoke_timeout · spec.smoke_timeout_secs > 0 用它 · 否则用默认 60s
+#[inline]
+fn smoke_timeout(spec: &TierSpec) -> Duration {
+    Duration::from_secs(if spec.smoke_timeout_secs > 0 { spec.smoke_timeout_secs } else { SMOKE_TIMEOUT_DEFAULT_SECS })
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct InstallLogPayload {
@@ -218,7 +224,7 @@ async fn run_install(job_id: &str, tier: &str, app: &AppHandle) -> Result<()> {
         emit_log(app, job_id, tier, "▶ 运行自检 smoke_test…", false);
         let mut sm = Command::new(&venv_py);
         sm.arg("-c").arg(&spec.smoke_test);
-        run_capture(app, job_id, tier, &mut sm, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        run_capture(app, job_id, tier, &mut sm, smoke_timeout(&spec))
             .await
             .map_err(|e| anyhow!("smoke_test 失败: {}", e))?;
     }
@@ -551,7 +557,7 @@ async fn install_prebuilt_venv(
         emit_log(app, job_id, tier, "▶ 运行 verify_cmd / smoke_test…", false);
         let mut sm = Command::new(&venv_py);
         sm.arg("-c").arg(&verify);
-        run_capture(app, job_id, tier, &mut sm, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        run_capture(app, job_id, tier, &mut sm, smoke_timeout(spec))
             .await
             .map_err(|e| anyhow!("verify 失败 (解压可能损坏): {}", e))?;
         emit_log(app, job_id, tier, "✓ 验证通过", false);
@@ -634,7 +640,7 @@ async fn run_install_binaries_only(
         let shell_flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
         let mut sm = Command::new(shell_cmd);
         sm.arg(shell_flag).arg(&spec.smoke_test).env("PATH", &combined_path);
-        run_capture(app, job_id, tier, &mut sm, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        run_capture(app, job_id, tier, &mut sm, smoke_timeout(&spec))
             .await
             .map_err(|e| anyhow!("smoke_test 失败: {} · 请检查 ffmpeg 可执行性", e))?;
         emit_log(app, job_id, tier, "✓ 自检通过", false);
@@ -827,7 +833,7 @@ async fn run_install_system_check_only(
             .filter_map(|p| std::path::Path::new(p).parent().map(|x| x.to_path_buf()))
             .collect();
         sm.env("PATH", build_path_with(&extra_bin_dirs));
-        run_capture(app, job_id, tier, &mut sm, Duration::from_secs(SMOKE_TIMEOUT_SECS))
+        run_capture(app, job_id, tier, &mut sm, smoke_timeout(&spec))
             .await
             .map_err(|e| anyhow!("smoke_test 失败: {} · 请检查 {} 命令可用性", e, spec.system_commands.join(",")))?;
         emit_log(app, job_id, tier, "✓ 自检通过", false);
@@ -976,19 +982,26 @@ fn extract_zip(archive: &PathBuf, dest: &PathBuf) -> Result<()> {
 }
 
 fn build_path_with(extra_dirs: &[PathBuf]) -> std::ffi::OsString {
-    let mut parts: Vec<std::ffi::OsString> = extra_dirs.iter()
+    let mut parts: Vec<PathBuf> = extra_dirs.iter()
         .filter(|p| p.exists())
-        .map(|p| p.clone().into_os_string())
+        .cloned()
         .collect();
+    // 2026-05-29 v8.1.4 灾难级 bug 修复:
+    //   旧代码: parts.push(existing /* 整个 "/usr/bin:/bin:..." */)
+    //   join_paths 期望每个元素是单独路径 · 含 ':' 直接 Err → unwrap_or_default() 返空
+    //   → 子进程 PATH 完全为空 → smoke_test 跑 blender/ffmpeg 全部 "command not found" (exit 127)
+    //   修复: 用 std::env::split_paths 把现有 PATH 拆成单路径再 push
     if let Some(existing) = std::env::var_os("PATH") {
-        parts.push(existing);
+        for p in std::env::split_paths(&existing) {
+            parts.push(p);
+        }
     }
     // 2026-05-25 8.0.9 · macOS GUI app (Finder/Launchpad 启动) PATH 通常不含 /usr/local/bin /opt/homebrew/bin
     // 这里兜底加系统标准路径 · 确保 sh / sleep / chmod / 用户装的 brew 工具可见
     #[cfg(unix)]
     {
         for p in ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/opt/homebrew/bin"] {
-            parts.push(p.into());
+            parts.push(PathBuf::from(p));
         }
     }
     std::env::join_paths(parts).unwrap_or_default()
