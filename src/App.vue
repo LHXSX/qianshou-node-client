@@ -20,6 +20,8 @@ import SettingsPage from "./pages/SettingsPage.vue"
 import HelpPage from "./pages/HelpPage.vue"
 import BundleStatusBar from "./components/BundleStatusBar.vue"
 import ConsentMatrixModal from "./components/ConsentMatrixModal.vue"
+// 2026-05-28 v8.1.3 · tier 装失败友好对话框 · 引导用户去 wujisuanli.com/#/runtime-mirrors
+import InstallHelpModal from "./components/InstallHelpModal.vue"
 import SplashAdModal from "./components/ads/SplashAdModal.vue"
 // 2026-05-25 8.0.9 · 广告/通知点击统一弹窗 (modal/embed_url/qr) · 全局单例
 import AdActionModal from "./components/ads/AdActionModal.vue"
@@ -273,6 +275,8 @@ watch(view, (v) => {
   <!-- 2026-05-25 8.0.9 · 广告/通知点击统一弹窗 · 全局单例 (Teleport to body 内部) -->
   <AdActionModal />
   <ConsentMatrixModal :open="showConsent" mode="onboarding" @close="closeConsent" />
+  <!-- 2026-05-28 v8.1.3 · tier 装失败弹官方指引 · 听 runtime_install_done success=false -->
+  <InstallHelpModal />
 </template>
 
 <style scoped>
