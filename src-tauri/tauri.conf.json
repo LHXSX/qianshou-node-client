@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "千手节点",
-  "version": "8.1.0",
+  "version": "8.1.1",
   "identifier": "com.qianshou.node-client",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -50,6 +50,10 @@
       "signingIdentity": null
     },
     "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
       "wix": {
         "language": "en-US"
       },

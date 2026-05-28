@@ -63,8 +63,10 @@ pub async fn call_tool_with_override(
     timeout_override: Option<Duration>,
     entry_file_override: Option<PathBuf>,
 ) -> Result<ToolCallOutput> {
+    // 2026-05-28 · global() 现返 Arc<SkillRegistry> · 通过 &*reg 拿 &SkillRegistry 给 locate_tool
+    //              reg 持续到函数返回 · skill/tool 借用安全跨 await
     let reg = skill_registry::global();
-    let (skill, tool) = locate_tool(reg, skill_id_hint, tool_name)
+    let (skill, tool) = locate_tool(&reg, skill_id_hint, tool_name)
         .ok_or_else(|| anyhow!("找不到工具: skill={:?}, tool={}", skill_id_hint, tool_name))?;
 
     let timeout = timeout_override

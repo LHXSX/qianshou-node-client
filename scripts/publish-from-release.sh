@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# publish-from-release.sh · v2 简洁版
+# publish-from-release.sh · v3 全平台版 (2026-05-28 补 Mac arm64)
 #
-# CI build 完后 · 一键从 GitHub Release 拉 Win + macOS Intel 产物
+# CI build 完后 · 一键从 GitHub Release 拉 Mac arm + Mac Intel + Win 三平台产物
 #   → 上传到生产 OTA 目录
-#   → 更新 binary.json 让 OTA endpoint 把 Win/Intel 用户也升到这个版本
+#   → 更新 binary.json platforms[{darwin-aarch64, darwin-x86_64, windows-x86_64}]
+#   → OTA endpoint 三平台 6h 内自动升级节点
 #
-# Mac arm64 不动 (已手工发了 · binary.json 里 darwin-aarch64 已经 8.1.0)
+# 历史: v2 只发 Win + Mac Intel (Mac arm64 手工发) · 现 CI workflow 三平台都出 asset
+#       补齐 Mac arm64 让一行发全完
 #
 # 用法 (auto mode · 从 GH Release 拉):
 #   GH_TOKEN=ghp_xxx ./scripts/publish-from-release.sh
@@ -37,8 +39,11 @@ WORKDIR="/tmp/qianshou-${VERSION}-release"
 PROD_DL_DIR="/var/www/web/downloads/latest"
 PROD_OTA_DIR="/var/www/qianshou-app/client-v3/binary/${VERSION}"
 
-# 期望的文件 (tauri-action 命名规则)
+# 期望的文件 (tauri-action 命名规则 · 2026-05-28 补 Mac arm64 3 个)
 EXPECT_FILES=(
+  "千手节点_${VERSION}_aarch64.dmg"                 # Mac arm64 · 下载页
+  "千手节点_${VERSION}_aarch64.app.tar.gz"          # Mac arm64 OTA payload
+  "千手节点_${VERSION}_aarch64.app.tar.gz.sig"      # Mac arm64 OTA 签名
   "千手节点_${VERSION}_x64-setup.exe"               # Win NSIS · 下载页 + OTA
   "千手节点_${VERSION}_x64-setup.exe.sig"           # Win OTA 签名
   "千手节点_${VERSION}_x64.dmg"                     # Mac Intel · 下载页
@@ -73,7 +78,7 @@ if [ "${MANUAL}" = "1" ]; then
     printf '  - %s\n' "${missing[@]}" >&2
     exit 1
   fi
-  ok "5 个文件齐"
+  ok "${#EXPECT_FILES[@]} 个文件齐"
   ls -la "${WORKDIR}"
   SKIP_DOWNLOAD=1
 fi
@@ -82,7 +87,7 @@ if [ "${SKIP_DOWNLOAD}" = "0" ]; then
 # ─────────────────────────────────────────────────────────
 # 1. 等 release ready
 # ─────────────────────────────────────────────────────────
-log "等 GitHub Release ${TAG} 的 5 个 assets 齐 (最多 45 min)"
+log "等 GitHub Release ${TAG} 的 ${#EXPECT_FILES[@]} 个 assets 齐 (最多 45 min)"
 
 API_URL="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
 WAIT_MAX=$((45 * 60))
@@ -108,7 +113,7 @@ sys.exit(0 if '${f}' in names else 1)
       fi
     done
     if [ ${#missing[@]} -eq 0 ]; then
-      ok "5 个文件齐 (elapsed=${elapsed}s)"
+      ok "${#EXPECT_FILES[@]} 个文件齐 (elapsed=${elapsed}s)"
       break
     fi
     warn "缺 ${#missing[@]} 个 (elapsed=${elapsed}s): ${missing[*]}"
@@ -194,16 +199,29 @@ for f in files:
     sz = os.path.getsize(os.path.join(extract, f))
     print(f"  {f}  ({sz} bytes)")
 
-# 分发规则
+# 分发规则 (2026-05-28 · 补 Mac arm64 三平台)
 moves = []
+# Mac arm64
+arm_dmg = f"千手节点_{VER}_aarch64.dmg"
+arm_appgz = f"千手节点_{VER}_aarch64.app.tar.gz"
+# Mac Intel
 exe = f"千手节点_{VER}_x64-setup.exe"
 dmg = f"千手节点_{VER}_x64.dmg"
 appgz = f"千手节点_{VER}_x64.app.tar.gz"
 
+# Mac arm64
+if arm_dmg in files:
+    moves += [(arm_dmg, DL, arm_dmg)]
+if arm_appgz in files:
+    moves += [(arm_appgz, OTA, arm_appgz)]
+if arm_appgz + ".sig" in files:
+    moves += [(arm_appgz + ".sig", OTA, arm_appgz + ".sig")]
+# Windows
 if exe in files:
     moves += [(exe, DL, exe), (exe, OTA, exe)]
 if exe + ".sig" in files:
     moves += [(exe + ".sig", OTA, exe + ".sig")]
+# Mac Intel
 if dmg in files:
     moves += [(dmg, DL, dmg)]
 if appgz in files:
@@ -232,47 +250,71 @@ PYEOF
 # ─────────────────────────────────────────────────────────
 log "更新 binary.json"
 
+# 2026-05-28 · 补 Mac arm64 签名 · 三平台同步入 binary.json
+ARM_SIG=$(cat "${WORKDIR}/千手节点_${VERSION}_aarch64.app.tar.gz.sig" 2>/dev/null || echo "")
 WIN_SIG=$(cat "${WORKDIR}/千手节点_${VERSION}_x64-setup.exe.sig" 2>/dev/null || echo "")
 INTEL_SIG=$(cat "${WORKDIR}/千手节点_${VERSION}_x64.app.tar.gz.sig" 2>/dev/null || echo "")
 
-if [ -z "${WIN_SIG}" ] || [ -z "${INTEL_SIG}" ]; then
-  warn "WIN_SIG 或 INTEL_SIG 空 · 跳过 binary.json 更新"
+if [ -z "${WIN_SIG}" ] || [ -z "${INTEL_SIG}" ] || [ -z "${ARM_SIG}" ]; then
+  warn "ARM_SIG / WIN_SIG / INTEL_SIG 中某个为空 · 跳过 binary.json 更新"
+  warn "  ARM_SIG=$( [ -n \"${ARM_SIG}\" ] && echo OK || echo MISSING )"
+  warn "  WIN_SIG=$( [ -n \"${WIN_SIG}\" ] && echo OK || echo MISSING )"
+  warn "  INTEL_SIG=$( [ -n \"${INTEL_SIG}\" ] && echo OK || echo MISSING )"
 else
-  ssh "${SSH_HOST}" "VERSION=${VERSION} WIN_SIG='${WIN_SIG}' INTEL_SIG='${INTEL_SIG}' python3 -" << 'PYEOF'
+  ssh "${SSH_HOST}" "VERSION=${VERSION} ARM_SIG='${ARM_SIG}' WIN_SIG='${WIN_SIG}' INTEL_SIG='${INTEL_SIG}' python3 -" << 'PYEOF'
 import json, os, shutil, urllib.parse
 from datetime import datetime, timezone
 
 VER = os.environ["VERSION"]
+ARM_SIG = os.environ["ARM_SIG"]
 WIN_SIG = os.environ["WIN_SIG"]
 INTEL_SIG = os.environ["INTEL_SIG"]
 
 path = "/var/www/qianshou-app/client-v3/binary.json"
-shutil.copy(path, path + f".bak.before-{VER}-multi")
+shutil.copy(path, path + f".bak.before-{VER}-all3")
 
 with open(path) as f:
     d = json.load(f)
 
+if "platforms" not in d:
+    d["platforms"] = {}
+
 base = f"https://www.wujisuanli.com/app/client-v3/binary/{VER}"
 
+# Mac arm64 (2026-05-28 补)
+arm_name = urllib.parse.quote(f"千手节点_{VER}_aarch64.app.tar.gz")
+d["platforms"]["darwin-aarch64"] = {
+    "url": f"{base}/{arm_name}",
+    "signature": ARM_SIG.strip(),
+}
+
+# Windows
 win_name = urllib.parse.quote(f"千手节点_{VER}_x64-setup.exe")
 d["platforms"]["windows-x86_64"] = {
     "url": f"{base}/{win_name}",
     "signature": WIN_SIG.strip(),
 }
 
+# Mac Intel
 intel_name = urllib.parse.quote(f"千手节点_{VER}_x64.app.tar.gz")
 d["platforms"]["darwin-x86_64"] = {
     "url": f"{base}/{intel_name}",
     "signature": INTEL_SIG.strip(),
 }
 
+# 顶级 version + pub_date (Tauri 2 updater 读的是顶级的 · 不是 platform 里的)
+d["version"] = VER
 d["pub_date"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+# url / signature 顶级默认写 mac arm64 (老客户端兑底读顶级字段)
+d["url"] = d["platforms"]["darwin-aarch64"]["url"]
+d["signature"] = d["platforms"]["darwin-aarch64"]["signature"]
 
 with open(path, "w") as f:
     json.dump(d, f, ensure_ascii=False, indent=2)
 shutil.chown(path, "nginx", "nginx")
 
-print(f"✓ binary.json 已更 · 3 平台齐:")
+print(f"✓ binary.json 已更 v{VER} · 3 平台齐:")
 for k, v in d["platforms"].items():
     print(f"  {k}: {v['url']}")
 PYEOF
@@ -294,5 +336,5 @@ for tgt_arch in "darwin/aarch64" "darwin/x86_64" "windows/x86_64"; do
   printf "  %-25s HTTP=%s  version=%s\n" "${tgt_arch}" "${status}" "${ver}"
 done
 
-ok "完成 · 8.1.0 已发 3 平台 OTA"
+ok "完成 · ${VERSION} 已发 3 平台 OTA (Mac arm/Intel + Win)"
 echo "下载页: https://www.wujisuanli.com/downloads/"

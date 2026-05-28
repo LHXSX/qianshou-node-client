@@ -1,1 +1,0 @@
-{"schema":1,"tier":"lite","python":"3.11.15","packages":["pillow","numpy","onnxruntime","pymupdf","pdfplumber","imageio-ffmpeg"],"created":"2026-05-24"}

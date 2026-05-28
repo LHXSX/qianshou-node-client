@@ -93,6 +93,26 @@ jobs:
       - name: install frontend deps
         run: npm ci
 
+      # 6.5 · prebake runtime (2026-05-28 加 · 修跨平台装失败 P0 bug)
+      #
+      # 历史: 早期把 mac-arm64 cpython (326MB) commit 进 git
+      #       → Intel mac / Windows build 出来后 bundle 进的是 mac-arm64 二进制
+      #       → 装上就跑不动 (架构不对) · 90% 装失败原因
+      #
+      # 新法: 每平台 runner 跑 prebake-runtime.sh 自下平台对应 cpython+uv
+      #       脚本写 src-tauri/resources/runtime/{cpython,manifest.json} + bin/uv-*
+      #       接着 tauri-action build · bundle resources/* 进 .app/.exe
+      #       客户端启动 bootstrap_bundled 拷到 ~/.qianshou/runtime/ (跟旧行为一致)
+      - name: prebake runtime (cpython + uv)
+        shell: bash
+        run: |
+          bash scripts/prebake-runtime.sh ${{ matrix.label }}
+          echo ""
+          echo "=== resources 目录确认 ==="
+          ls -la src-tauri/resources/runtime/cpython/ || true
+          ls -la src-tauri/resources/bin/ || true
+          cat src-tauri/resources/runtime/manifest.json
+
       # 7 · Tauri 一键 build + 自动签名 + (可选) 上传到 Releases
       - name: build & publish
         uses: tauri-apps/tauri-action@v0

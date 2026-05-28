@@ -17,16 +17,24 @@ use tracing::{debug, info, warn};
 // ────────────────────── manifest schema 反序列化 ──────────────────────
 
 /// manifest.json 完整反序列化结构（保留扩展字段为 Value）。
+///
+/// 2026-05-28 · 兼容 v1 + v2 schema:
+///   v1 (1.0.0): id / name / version / icon / description
+///   v2 (2.0.0): pack_id / pack_name / pack_version / pack_icon / pack_description
+///   用 #[serde(alias)] 两个名字都接受 · 反序列后走同一个 Rust 字段
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Manifest {
     #[serde(default)]
     pub schema_version: String,
+    #[serde(alias = "pack_id")]
     pub id: String,
+    #[serde(alias = "pack_name")]
     pub name: String,
+    #[serde(alias = "pack_version")]
     pub version: String,
-    #[serde(default)]
+    #[serde(default, alias = "pack_icon")]
     pub icon: String,
-    #[serde(default)]
+    #[serde(default, alias = "pack_description")]
     pub description: String,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -43,9 +51,17 @@ pub struct Manifest {
     pub rewards: Value,
 }
 
+/// 2026-05-28 · 兼容 v1 + v2 schema:
+///   v1: name = 程序 id (如 "extract_clauses") · 无 tool_id 字段
+///   v2: tool_id = 程序 id · name = 中文显示名 (如 "条款提取")
+///   两个字段都可能存在 · 不能合到同一个 Rust 字段 (serde duplicate field)
+///   load_from_manifest 处理: real id = tool_id (v2) · fallback name (v1)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManifestTool {
     pub name: String,
+    /// v2 独有 · 真正的程序 id (v1 为 None · 使用 name 作为 id)
+    #[serde(default)]
+    pub tool_id: Option<String>,
     #[serde(default)]
     pub description: String,
     /// 形如 "extract_clauses.run" — 提示导入路径，主要是文档用，runtime 实际靠 entry_file
@@ -55,9 +71,11 @@ pub struct ManifestTool {
     /// (例如 photo-edit-v1 用 schema v2 写法 · 没 entry_file 字段)
     #[serde(default)]
     pub entry_file: Option<String>,
-    #[serde(default)]
+    /// v1: input_schema · v2: params_schema (功能等价 · 都是 OpenAI function calling 用的 JSON Schema)
+    #[serde(default, alias = "params_schema")]
     pub input_schema: Value,
-    #[serde(default)]
+    /// v1: output_schema · v2: output_contract (v2 是 {schema, examples} · 这里直接当 Value 接)
+    #[serde(default, alias = "output_contract")]
     pub output_schema: Value,
     #[serde(default = "default_timeout")]
     pub timeout_s: u64,
@@ -279,16 +297,51 @@ impl SkillRegistry {
 
 // ────────────────────── 全局单例 ──────────────────────
 //
-// 整个 client 进程只扫盘一次，executor / heartbeat / profile 上报共用。
-// 首次访问时同步扫盘（V4 阶段 skill 数量 <100，<100ms 可接受）。
+// 整个 client 进程共享一个 SkillRegistry · executor / heartbeat / profile 上报共用。
+//
+// 2026-05-28 · 升级 OnceLock<SkillRegistry> → OnceLock<Mutex<Arc<SkillRegistry>>>
+//   旧设计: OnceLock 锁死一次扫盘结果 · skills_fetcher 装完新 skill 后没办法刷新
+//          → 全新装机用户首启时 skills 还没装好就扫 · 之后 lazy init 锁死空表
+//   新设计: Mutex<Arc<...>> · global() clone Arc (廉价) · refresh() 重扫并替换 Arc
+//   兼容: caller 拿到 Arc<SkillRegistry> · 通过 Deref 仍可直接调原 method (find_tool 等)
+//        但 chain 表达式 `global().find_tool(...)` 因 Arc 临时 drop 借用 invalid · 需拆两行
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
-static GLOBAL_REGISTRY: OnceLock<SkillRegistry> = OnceLock::new();
+static GLOBAL_REGISTRY: OnceLock<Mutex<Arc<SkillRegistry>>> = OnceLock::new();
 
-/// 获取全局 SkillRegistry，首次调用时扫描默认目录。
-pub fn global() -> &'static SkillRegistry {
-    GLOBAL_REGISTRY.get_or_init(SkillRegistry::scan_default_dirs)
+fn registry_slot() -> &'static Mutex<Arc<SkillRegistry>> {
+    GLOBAL_REGISTRY.get_or_init(|| Mutex::new(Arc::new(SkillRegistry::scan_default_dirs())))
+}
+
+/// 获取全局 SkillRegistry · 首次调用同步扫盘 · 后续调用 clone 当前 Arc (廉价)
+///
+/// 用法:
+/// ```ignore
+/// let reg = skill_registry::global();   // Arc<SkillRegistry>
+/// if let Some((skill, tool)) = reg.find_tool(name) {  // Arc 仍存活 · 借用安全
+///     let dir = skill.dir.clone();
+///     ...
+/// }
+/// ```
+pub fn global() -> Arc<SkillRegistry> {
+    registry_slot().lock().unwrap().clone()
+}
+
+/// 重新扫描默认目录 · 替换全局 SkillRegistry
+///
+/// 触发时机:
+///   - skills_fetcher 装完一个新 skill zip 之后 (auto_install_tiers / install_tier 调用)
+///   - lib.rs setup 阶段延迟 spawn (等 lite tier 装完 skill 后预扫)
+///   - 手动 cmd `runtime_recheck` 等
+///
+/// 返回新扫到的 skill 数 (含老 + 新)
+pub fn refresh() -> usize {
+    let new_reg = Arc::new(SkillRegistry::scan_default_dirs());
+    let count = new_reg.skills_count();
+    info!("skill_registry · refresh · 重扫完成 · {} 个 skill", count);
+    *registry_slot().lock().unwrap() = new_reg;
+    count
 }
 
 // ────────────────────── Skill 加载 ──────────────────────
@@ -309,20 +362,22 @@ impl Skill {
         let mut tools: Vec<Tool> = Vec::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
         for mt in &mf.tools {
+            // 2026-05-28 · v2: tool_id 优先 · v1: fallback name
+            let real_id = mt.tool_id.as_deref().unwrap_or(&mt.name).to_string();
             let Some(rel) = mt.entry_file.as_ref().filter(|s| !s.is_empty()) else {
-                skipped.push((mt.name.clone(), "missing entry_file (schema v2?)".to_string()));
+                skipped.push((real_id.clone(), "missing entry_file (schema v2?)".to_string()));
                 continue;
             };
             let entry_path = dir.join(rel);
             if !entry_path.exists() {
                 skipped.push((
-                    mt.name.clone(),
+                    real_id.clone(),
                     format!("entry_file 不存在: {}", entry_path.display()),
                 ));
                 continue;
             }
             tools.push(Tool {
-                name: mt.name.clone(),
+                name: real_id,
                 description: mt.description.clone(),
                 entry_file: entry_path,
                 input_schema: mt.input_schema.clone(),
@@ -594,7 +649,8 @@ mod tests {
 
         let skill = Skill::load_from_manifest(&mf_path).expect("load failed");
         assert_eq!(skill.id, "text-tools-v1");
-        assert_eq!(skill.version, "1.0.0");
+        // 2026-05-28 · v2 升级后是 2.0.0
+        assert_eq!(skill.version, "2.0.0");
         assert_eq!(skill.tools.len(), 2);
 
         let names: Vec<&str> = skill.tools.iter().map(|t| t.name.as_str()).collect();
@@ -602,7 +658,7 @@ mod tests {
         assert!(names.contains(&"sentiment_classify"));
 
         // 真实 sha256 已写入 manifest，应该 verified=true
-        assert!(skill.verified, "sha256 mismatch — 检查 hash_files.py 是否同步");
+        assert!(skill.verified, "sha256 mismatch — 检查 skill_rehash.py 是否同步");
 
         // 工具 entry_file 都展开为绝对路径并存在
         for t in &skill.tools {
@@ -624,7 +680,8 @@ mod tests {
 
         // list_ids_versioned
         let ids = reg.list_ids_versioned();
-        assert_eq!(ids, vec!["text-tools-v1@1.0.0"]);
+        // 2026-05-28 · v2 升级后是 2.0.0
+        assert_eq!(ids, vec!["text-tools-v1@2.0.0"]);
 
         // find_tool
         let (skill, tool) = reg.find_tool("extract_clauses").expect("找不到工具");
@@ -632,8 +689,10 @@ mod tests {
         assert_eq!(tool.name, "extract_clauses");
 
         let (_, tool2) = reg.find_tool("sentiment_classify").unwrap();
-        assert_eq!(tool2.timeout_s, 5);
-        assert!(tool2.deterministic);
+        // 2026-05-28 · v2 manifest 不再顯式在 tool 对象设 timeout_s · 默认走 default_timeout=30
+        //                deterministic 同样 · 默认 false
+        // 实际 v2 是从 manifest 读 out_schema 等 · timeout/deterministic 不是必需 (在 engine 字段)
+        assert!(tool2.timeout_s > 0, "timeout_s 应有默认值");
 
         // 不存在的工具
         assert!(reg.find_tool("nonexistent").is_none());

@@ -196,6 +196,19 @@ pub fn run() {
             // 当前: 仅 lite (基础包 pillow numpy 等) · executor 路由的兜底 venv
             // 老后端不发 auto_install 字段 = false · 此函数等于 no-op (兼容)
             runtime::auto_install_tiers::spawn_auto_install(app.handle().clone());
+
+            // 2026-05-28 · skill_registry 周期性预扫 · 保证全新装机 · auto_install 装完 skill
+            //              后无需重启即可被 executor.v2 path 找到 (skill_registry 是可刷新版)
+            //              第 1 次 5s 后 (启动期可能还没装好 · 扫到啥算啥)
+            //              第 2 次 60s 后 (lite tier venv + 4 v2 skill 通常已就绪)
+            //              第 3 次 180s 后 (大 tier 装久的兜底)
+            tauri::async_runtime::spawn(async move {
+                for (idx, delay_s) in [5u64, 60, 180].iter().enumerate() {
+                    tokio::time::sleep(std::time::Duration::from_secs(*delay_s)).await;
+                    let n = crate::task::skill_registry::refresh();
+                    tracing::info!("skill_registry · 启动期第 {} 次预扫 · {} 个 skill", idx + 1, n);
+                }
+            });
             // M3.3：系统托盘（菜单 + 关闭主窗口最小化到托盘）
             let show_item = MenuItem::with_id(app, "show", "打开主面板", true, None::<&str>)?;
             let pause_item = MenuItem::with_id(app, "pause", "暂停贡献", true, None::<&str>)?;

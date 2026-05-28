@@ -252,17 +252,21 @@ async fn run_install(job_id: &str, tier: &str, app: &AppHandle) -> Result<()> {
             match super::skills_fetcher::fetch_and_install(skill_id).await {
                 Ok(r) => {
                     installed_skills.insert(r.skill_id.clone(), r.version.clone());
+                    // 2026-05-28 · skill_registry 立刻 refresh · 让 executor.v2 path 能找到新装的 entry
+                    //              (skill_registry 改成 Mutex<Arc<>> · 支持运行时刷新)
+                    let after = crate::task::skill_registry::refresh();
                     emit_log(
                         app,
                         job_id,
                         tier,
                         &format!(
-                            "  ✓ {} v{} · {} 个文件 · {:.1} KB · sha {}…",
+                            "  ✓ {} v{} · {} 个文件 · {:.1} KB · sha {}… · registry 共 {} skill",
                             r.skill_id,
                             if r.version.is_empty() { "?" } else { r.version.as_str() },
                             r.file_count,
                             (r.size_bytes as f64) / 1024.0,
-                            &r.sha256[..12.min(r.sha256.len())]
+                            &r.sha256[..12.min(r.sha256.len())],
+                            after,
                         ),
                         false,
                     );

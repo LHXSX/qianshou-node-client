@@ -51,6 +51,8 @@ const groups: NavGroup[] = [
   {
     label: "节点",
     items: [
+      // 2026-05-28 v8.1.1 · 节点信誉自查面板 · 用户看自己 NCE 评分 + 建议
+      { id: "nce",           icon: "shield",        label: "节点信誉" },
       { id: "device",        icon: "nav-device",    label: "设备信息" },
       { id: "throttle",      icon: "nav-throttle",  label: "算力调节" },
     ],

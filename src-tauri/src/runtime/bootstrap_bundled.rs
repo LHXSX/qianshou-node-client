@@ -23,15 +23,65 @@ use tauri::{AppHandle, Manager};
 
 use super::paths;
 
+/// 当前编译目标的 platform 标签 · 跟 bundle prebake 时写入 runtime/manifest.json 的 "platform" 字段对齐
+pub fn current_platform_label() -> &'static str {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "macos-aarch64"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "macos-x86_64"
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "windows-x86_64"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "linux-x86_64"
+    } else {
+        "unknown"
+    }
+}
+
+/// 读 runtime/manifest.json 的 platform 字段 · 失败返 ""
+fn read_stored_platform(manifest_path: &Path) -> String {
+    let txt = match std::fs::read_to_string(manifest_path) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&txt) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    v.get("platform")
+        .and_then(|p| p.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// 首次启动入口 · 不抛错 (失败就让 installer 走老路径)
+///
+/// 2026-05-28 · 加 platform mismatch 检测 ·
+///   - 老 8.0.x 用户装过 cpython 到 ~/.qianshou/runtime/ · 升 8.1.0 跨架构装
+///     (比如 Intel mac 上装到 arm64 的客户端 · 或 Win 上首次装) 时
+///   - bundle 里 prebake 的是正确平台 · 但本地已存 manifest.json 平台不对
+///   - 旧逻辑只看 marker 存在就跳 · 永远用错的 cpython 跑 → 所有 v2 task 失败
+///   - 新逻辑: marker 平台不匹配 → 整个 dest 清空重做
 pub async fn ensure_bundled_runtime(app: &AppHandle) -> Result<()> {
     let dest = paths::runtime_root();
 
-    // 1. 已经 bootstrap 过 · 跳
+    // 1. 已经 bootstrap 过 · 检查 platform 是否匹配
     let marker = dest.join("manifest.json");
     if marker.exists() {
-        tracing::debug!("runtime/manifest.json 已存在 · 跳过 bundle bootstrap");
-        return Ok(());
+        let current = current_platform_label();
+        let stored = read_stored_platform(&marker);
+        if stored == current {
+            tracing::debug!("runtime/manifest.json 已存在且 platform={} 匹配 · 跳过 bundle bootstrap", current);
+            return Ok(());
+        }
+        tracing::warn!(
+            "runtime/manifest.json platform 不匹配 (stored='{}' current='{}') · 删除重做",
+            stored, current
+        );
+        // 删整个 dest · 让后续逻辑重新拷
+        if let Err(e) = std::fs::remove_dir_all(&dest) {
+            tracing::warn!("删除旧 runtime 失败: {} · 强行继续 (新文件覆盖老的)", e);
+        }
     }
 
     // 2. bundle 里有预烘焙吗
@@ -185,16 +235,12 @@ fn write_installed_meta(_dest: &PathBuf) -> Result<()> {
         binaries.insert("ffmpeg".into(), ffmpeg_bin);
     }
 
-    let platform_label = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "macos-arm64"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "macos-x86_64"
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "windows-x86_64"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "linux-x86_64"
-    } else {
-        "unknown"
+    // 2026-05-28 · 复用 current_platform_label() 顶层定义 · 跟 ensure_bundled_runtime 校验逻辑统一
+    //              注意: detector.InstalledMeta.platform 老格式是 macos-arm64 (不带 e) · 这里保留兼容
+    //              ensure_bundled_runtime 用的 macos-aarch64 是 bundle prebake manifest 的字段
+    let platform_label = match current_platform_label() {
+        "macos-aarch64" => "macos-arm64",  // detector schema 历史用 arm64 短名 · 不破老 backend
+        other => other,
     };
 
     let mut tiers: BTreeMap<String, InstalledTier> = BTreeMap::new();

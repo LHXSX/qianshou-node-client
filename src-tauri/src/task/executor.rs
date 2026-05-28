@@ -98,12 +98,28 @@ async fn try_run(task: &TaskAssign) -> Result<(String, i32)> {
     // 节点不内置 task_type · 全部通过 code_url 下载 backend 脚本跑
     // (新增 task 只需后端加 .py · 节点零修改 · 真正可扩展)
     //
-    // unknown task_type → 自动当作 script 跑 (v8 submit 时 code_url 会自动指向 /api/v8/scripts/{task_type}.py)
+    // 2026-05-28 v2 升级 · 增加 v2 本地 entry 快路:
+    //   未知 task_type 在进入 script 下载分支前 · 先查本地 skill_registry (装在 ~/.local/lib/edgecompute/skills/)
+    //   命中 → 跳过 download · 直接跑 tool.entry_file (低延迟 + 离线可跑 + _runtime 在 sys.path)
+    //   未命中 → fall through 到 v1 script 路径 (拉 code_url 跑)
     match task.task_type.as_str() {
         "shell" => run_shell(task, timeout).await,
         "script" => run_script(task, timeout).await,
         "llm_infer" => run_llm_infer(task, timeout).await,
         _ => {
+            // V2 本地 entry 优先 (快 · 离线 · 完整 _runtime)
+            // 2026-05-28 · global() 现返 Arc<SkillRegistry> · 拆两行让 Arc 跨过 find_tool 借用作用域
+            let reg = super::skill_registry::global();
+            if let Some((skill, tool)) = reg.find_tool(&task.task_type) {
+                let skill_dir = skill.dir.clone();
+                let entry_file = tool.entry_file.clone();
+                let tool_name = tool.name.clone();
+                tracing::info!(
+                    "executor.v2 · task_type={} 命中 skill={} entry={:?}",
+                    task.task_type, skill.id, entry_file
+                );
+                return run_v2_skill(task, skill_dir, entry_file, tool_name, timeout).await;
+            }
             // 默认走 script 模式 · 适配 v8 提任务 (task_type=dedup_lines/base64_encode/...)
             if !task.code_url.is_empty() {
                 run_script(task, timeout).await
@@ -256,6 +272,106 @@ async fn run_shell(task: &TaskAssign, timeout: Duration) -> Result<(String, i32)
 /// commands.rs::set_throttle_level 会调 update_throttle_level() 同步
 fn current_throttle_level() -> ThrottleLevel {
     super::resource_limit::current_level()
+}
+
+/// 2026-05-28 · V2 本地 entry 路径 · 不下载 code_url · 直接跑 ~/.local/lib/edgecompute/skills/<pack>/<file>.py
+///
+/// 调用前提:
+///   - skill_registry::global().find_tool(task_type) 命中
+///   - skill_dir = skill 装入目录 (含 _runtime/ 子目录)
+///   - entry_file = tool 的 .py 绝对路径
+///
+/// stdin 协议 (v2 _runtime/context.py SkillContext.from_stdin_and_env):
+///   { params, input_kind, inline_input, input_file, input_refs,
+///     slice_meta, task_id, shard_id, workload_id, tool_name }
+///
+/// 节点 task.args 已含后端扣出的这些字段 · 直接透传 · 补上 task_id/tool_name 上下文
+async fn run_v2_skill(
+    task: &TaskAssign,
+    skill_dir: std::path::PathBuf,
+    entry_file: std::path::PathBuf,
+    tool_name: String,
+    timeout: Duration,
+) -> Result<(String, i32)> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    // 1. 选 python (tier 路由) · 复用 pick_python_for_task
+    let (python_bin, bundled_pythonpath) = pick_python_for_task(task, "python3");
+
+    // 2. 构造 stdin JSON · 透传 task.args + 补上上下文
+    let mut stdin_data = if task.args.is_object() {
+        task.args.clone()
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(obj) = stdin_data.as_object_mut() {
+        obj.entry("task_id".to_string())
+            .or_insert(serde_json::Value::String(task.task_id.clone()));
+        obj.entry("tool_name".to_string())
+            .or_insert(serde_json::Value::String(tool_name.clone()));
+    }
+    let stdin_bytes = serde_json::to_vec(&stdin_data).context("序列化 v2 stdin 失败")?;
+
+    // 3. spawn python <entry_file> · cwd = skill_dir (sys.path 默认含当前目录 → _runtime 可 import)
+    let mut command = Command::new(&python_bin);
+    crate::proc_util::hide_window_tokio(&mut command);
+    resource_limit::apply(&mut command, current_throttle_level());
+    command.arg(&entry_file);
+    command.current_dir(&skill_dir);
+    command.kill_on_drop(true);
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    // 4. PYTHONPATH = bundled_pythonpath + skill_dir (多一层保险 _runtime 能 import)
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let mut path_parts: Vec<String> = bundled_pythonpath
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    path_parts.push(skill_dir.to_string_lossy().into_owned());
+    if let Ok(existing) = std::env::var("PYTHONPATH") {
+        if !existing.is_empty() {
+            path_parts.push(existing);
+        }
+    }
+    command.env("PYTHONPATH", path_parts.join(sep));
+
+    // 5. 上下文 env vars (v2 context.py 支持 stdin / env 双通道)
+    command.env("EC_TASK_ID", &task.task_id);
+    command.env("EC_TOOL_NAME", &tool_name);
+    if let Some(params) = stdin_data.get("params") {
+        command.env("EC_PARAMS", serde_json::to_string(params).unwrap_or_default());
+    }
+    if let Some(ik) = stdin_data.get("input_kind").and_then(|v| v.as_str()) {
+        command.env("EC_INPUT_KIND", ik);
+    }
+
+    // 6. 启动 + 喉 stdin
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("v2 skill spawn 失败: {}", python_bin))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&stdin_bytes).await;
+        drop(stdin);
+    }
+
+    // 7. 等结果 · 带 timeout
+    let wait = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    match wait {
+        Err(_) => Err(anyhow!("v2 skill 超时（{}秒）", timeout.as_secs())),
+        Ok(Err(e)) => Err(anyhow!("v2 skill 等待子进程失败: {}", e)),
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let exit_code = output.status.code().unwrap_or(-1);
+            // stderr 走 tracing · 不污染业务输出
+            if !output.stderr.is_empty() {
+                let s = String::from_utf8_lossy(&output.stderr);
+                let preview: String = s.chars().take(500).collect();
+                tracing::warn!("v2 skill stderr (task={}): {}", task.task_id, preview);
+            }
+            Ok((stdout, exit_code))
+        }
+    }
 }
 
 /// V8.1 (2026-05-27) · 按 task.required_tier 选 venv 跑 Python 脚本

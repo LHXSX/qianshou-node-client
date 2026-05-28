@@ -51,3 +51,12 @@ src-tauri/Cargo.lock
 
 # 国内 cargo 镜像配置 (本地 · CI 用官方)
 src-tauri/.cargo/
+
+# 2026-05-28 · prebake runtime 不再 commit · CI 各平台 runner 跑 prebake-runtime.sh 各自下载
+#   原因: 早期把 mac-arm64 cpython (326M) commit 进 git · 导致 mac Intel + Windows 装上跑不动
+#   保留: resources/{bin,runtime}/README.md (说明用 · ! 取反)
+src-tauri/resources/runtime/cpython/
+src-tauri/resources/runtime/envs/
+src-tauri/resources/runtime/manifest.json
+src-tauri/resources/bin/uv-*
+src-tauri/resources/bin/uv.exe

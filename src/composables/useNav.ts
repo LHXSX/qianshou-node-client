@@ -11,6 +11,7 @@ export type PageId =
   | "toolbox"
   | "ai-capability"
   | "capabilities"
+  | "nce" // 2026-05-28 v8.1.1 · 节点信誉自查面板 (MyNCEPage)
   | "settings"
   | "help"
 

@@ -14,6 +14,8 @@ import HistoryPage from "./pages/HistoryPage.vue"
 import ToolboxPage from "./pages/ToolboxPage.vue"
 import AICapabilityPage from "./pages/AICapabilityPage.vue"
 import CapabilitiesPage from "./pages/CapabilitiesPage.vue"
+// 2026-05-28 v8.1.1 · 节点信誉自查面板
+import MyNCEPage from "./pages/MyNCEPage.vue"
 import SettingsPage from "./pages/SettingsPage.vue"
 import HelpPage from "./pages/HelpPage.vue"
 import BundleStatusBar from "./components/BundleStatusBar.vue"
@@ -99,6 +101,7 @@ const currentPageComp = computed(() => {
     case "toolbox": return ToolboxPage
     case "ai-capability": return AICapabilityPage
     case "capabilities": return CapabilitiesPage
+    case "nce": return MyNCEPage
     case "settings": return SettingsPage
     case "help": return HelpPage
   }
