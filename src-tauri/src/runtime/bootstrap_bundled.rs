@@ -244,6 +244,8 @@ fn write_installed_meta(_dest: &PathBuf) -> Result<()> {
     };
 
     let mut tiers: BTreeMap<String, InstalledTier> = BTreeMap::new();
+
+    // 老 image tier (8.0.x 兼容 · 保留)
     tiers.insert(
         "image".into(),
         InstalledTier {
@@ -268,6 +270,59 @@ fn write_installed_meta(_dest: &PathBuf) -> Result<()> {
             installed_skills: BTreeMap::new(),
         },
     );
+
+    // 2026-05-28 v8.1.2 · prebake-runtime.sh 已烘焙 lite + crawl venv 进 bundle
+    // 节点首启 bootstrap 拷过来后这两个 venv 已就绪 · 标 ok · ws hello 上报 software
+    // 让 planner 立刻能派算力/GEO/爬虫任务 (不等 auto_install_tiers 跑 pip install 30-60s)
+    //
+    // 检测方式: 看 ~/.qianshou/runtime/venvs/<tier>/bin/python (或 win Scripts/python.exe) 是否存在
+    let lite_venv_py = paths::venv_python("lite");
+    if lite_venv_py.exists() {
+        tiers.insert(
+            "lite".into(),
+            InstalledTier {
+                ok: true,
+                python: lite_venv_py.to_string_lossy().into_owned(),
+                packages: vec!["pillow", "numpy", "onnxruntime", "PyMuPDF", "pdfplumber"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                software: vec!["pillow", "numpy", "onnxruntime", "pymupdf", "pdfplumber"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                mirror_label: "bundled".into(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                last_message: "客户端内置 lite venv · 开箱即跑算力任务 · 0 装机 0 网络".into(),
+                binaries: BTreeMap::new(),
+                installed_skills: BTreeMap::new(),
+            },
+        );
+    }
+
+    let crawl_venv_py = paths::venv_python("crawl");
+    if crawl_venv_py.exists() {
+        tiers.insert(
+            "crawl".into(),
+            InstalledTier {
+                ok: true,
+                python: crawl_venv_py.to_string_lossy().into_owned(),
+                packages: vec!["requests", "selectolax", "tldextract", "readability-lxml", "lxml"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                software: vec!["requests", "selectolax", "readability", "tldextract"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                mirror_label: "bundled".into(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                last_message: "客户端内置 crawl venv · 开箱即跑爬虫/GEO 任务 · 0 装机 0 网络".into(),
+                binaries: BTreeMap::new(),
+                installed_skills: BTreeMap::new(),
+            },
+        );
+    }
 
     let meta = InstalledMeta {
         schema_version: "2".into(),

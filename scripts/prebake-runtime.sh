@@ -122,17 +122,87 @@ fi
 rm -rf "$TMP_UV"
 echo "      → $DEST_BIN_DIR/$UV_BIN_NAME"
 
-# ─── 3. 写 manifest.json (bootstrap_bundled 用这个判平台是否匹配) ──────────
+# ─── 3. 烘焙 lite + crawl venv (双端内置 · 0 装机网络依赖) ──────────────
+# 用户痛点: 客户首启装 lite/crawl tier 时 pip install 失败 (国内 mirror 超时 ·
+# Windows 缺 VC++ build tools 编译 lxml 失败 · 30% 客户卡死弃用)
+# 解法: CI build 时把 venv 烘焙进 bundle · 节点 bootstrap_bundled 直接拷 · 0 装
+DEST_VENVS_DIR="$DEST_RESOURCES/runtime/venvs"
+mkdir -p "$DEST_VENVS_DIR"
+
+if [[ "$PLATFORM" == "windows-x64" ]]; then
+    PY_BIN_REL="python.exe"
+    VENV_PY_REL="Scripts/python.exe"
+else
+    PY_BIN_REL="bin/python3.11"
+    VENV_PY_REL="bin/python"
+fi
+HOST_PY="$CPYTHON_TARGET/$PY_BIN_REL"
+
+# uv 路径 (跨平台)
+UV_BIN_PATH="$DEST_BIN_DIR/$UV_BIN_NAME"
+[[ -f "$HOST_PY" ]] || { echo "ERROR: host python 不存在: $HOST_PY" >&2; exit 5; }
+[[ -f "$UV_BIN_PATH" ]] || { echo "ERROR: uv binary 不存在: $UV_BIN_PATH" >&2; exit 5; }
+chmod +x "$UV_BIN_PATH" || true
+
+# tier 列表 + 包 + 自检 (跟 backend bundles.py auto_install tier 对齐)
+prebake_tier() {
+    local tier="$1"
+    local packages="$2"
+    local verify="$3"
+    local venv_path="$DEST_VENVS_DIR/$tier"
+    
+    echo "[3/3] 烘焙 $tier venv (packages: $packages)"
+    rm -rf "$venv_path"
+    
+    # 用 host cpython 创 venv
+    "$HOST_PY" -m venv "$venv_path"
+    
+    local venv_py="$venv_path/$VENV_PY_REL"
+    [[ -f "$venv_py" ]] || { echo "ERROR: venv python 不存在: $venv_py" >&2; return 1; }
+    
+    # uv pip install · 用阿里云镜像 (CI 任意地点都能拉到)
+    "$UV_BIN_PATH" pip install \
+        --python "$venv_py" \
+        --index-url https://mirrors.aliyun.com/pypi/simple \
+        --allow-insecure-host mirrors.aliyun.com \
+        $packages || {
+        echo "ERROR: uv pip install 失败 (tier=$tier)" >&2
+        return 2
+    }
+    
+    # 自检
+    "$venv_py" -c "$verify" || {
+        echo "ERROR: $tier 自检失败" >&2
+        return 3
+    }
+    
+    local size=$(du -sh "$venv_path" | cut -f1)
+    echo "      ✓ $tier venv 烘焙 OK · size=$size"
+}
+
+# lite tier (auto_install=true · 算力业务必装)
+prebake_tier "lite" \
+    "pillow numpy onnxruntime PyMuPDF pdfplumber" \
+    "import PIL, numpy, onnxruntime, fitz, pdfplumber; print('lite ok')"
+
+# crawl tier (auto_install=true · 爬虫 + GEO 业务必装)
+prebake_tier "crawl" \
+    "requests selectolax tldextract readability-lxml lxml" \
+    "import requests, selectolax, tldextract; from readability import Document; print('crawl ok')"
+
+# ─── 4. 写 manifest.json (bootstrap_bundled 用这个判平台是否匹配 + 含 venvs 标记) ──
 cat > "$DEST_RESOURCES/runtime/manifest.json" << EOF
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "bundled_at": "$(date -u +%Y-%m-%d)",
   "python": "${PY_VERSION}",
   "uv": "${UV_VERSION}",
-  "platform": "${PLATFORM_LABEL}"
+  "platform": "${PLATFORM_LABEL}",
+  "bundled_venvs": ["lite", "crawl"],
+  "note": "lite+crawl venv 已内置 · 节点首启 0 装 0 网络"
 }
 EOF
-echo "[3/3] 写 $DEST_RESOURCES/runtime/manifest.json (platform=$PLATFORM_LABEL)"
+echo "[4/4] 写 $DEST_RESOURCES/runtime/manifest.json (platform=$PLATFORM_LABEL · bundled_venvs=[lite,crawl])"
 
 # ─── 校验: bundled_python_bin 能不能找到 ──────────────────────────────────
 EXPECTED_PY_BIN="$CPYTHON_TARGET/bin/python3.11"
