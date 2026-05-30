@@ -34,7 +34,7 @@ async fn run_auto_install(app: &AppHandle) -> anyhow::Result<()> {
     // 拉 manifest · 失败重试 (最多 3 次 · 间隔 30s)
     let mut m_opt: Option<manifest::RuntimeManifest> = None;
     for attempt in 1..=3 {
-        match manifest::fetch().await {
+        match manifest::fetch(&Default::default()).await {
             Ok(m) => {
                 m_opt = Some(m);
                 break;

@@ -38,20 +38,40 @@ pub fn current_platform_label() -> &'static str {
     }
 }
 
-/// 读 runtime/manifest.json 的 platform 字段 · 失败返 ""
-fn read_stored_platform(manifest_path: &Path) -> String {
-    let txt = match std::fs::read_to_string(manifest_path) {
-        Ok(s) => s,
-        Err(_) => return String::new(),
+/// bundle / 已装 runtime 的身份信息 (从 manifest.json 读)
+struct ManifestIdentity {
+    platform: String,
+    python: String,
+    bundled_at: String,
+}
+
+/// 读 manifest.json 的 platform / python / bundled_at · 缺字段返 ""
+fn read_manifest_identity(manifest_path: &Path) -> ManifestIdentity {
+    let txt = std::fs::read_to_string(manifest_path).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+    let get = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
     };
-    let v: serde_json::Value = match serde_json::from_str(&txt) {
-        Ok(v) => v,
-        Err(_) => return String::new(),
-    };
-    v.get("platform")
-        .and_then(|p| p.as_str())
-        .unwrap_or_default()
-        .to_string()
+    ManifestIdentity {
+        platform: get("platform"),
+        python: get("python"),
+        bundled_at: get("bundled_at"),
+    }
+}
+
+/// 刷新时删旧 cpython 目录 · 防新旧版本目录 (cpython-3.11.10 / cpython-3.11.13) 并存
+/// (bundled_python_bin 假设只有一个 cpython-* 目录)
+/// venvs/ 用的是 uv 装的 python (uv_python_dir) · 与 cpython/ 无关 · 删之安全
+fn remove_bundled_cpython(dest: &Path) {
+    let cpython = dest.join("cpython");
+    if cpython.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&cpython) {
+            tracing::warn!("刷新时删旧 cpython 失败: {} · 继续 (copy_tree 会覆盖)", e);
+        }
+    }
 }
 
 /// 2026-05-28 v8.1.3 · 归一化 platform label · 兼容老 8.0.x 用 Python triple
@@ -100,41 +120,7 @@ fn normalize_platform_label(raw: &str) -> String {
 pub async fn ensure_bundled_runtime(app: &AppHandle) -> Result<()> {
     let dest = paths::runtime_root();
 
-    // 1. 已经 bootstrap 过 · 检查 platform 是否匹配 (归一化后比)
-    let marker = dest.join("manifest.json");
-    if marker.exists() {
-        let current = normalize_platform_label(current_platform_label());
-        let stored = normalize_platform_label(&read_stored_platform(&marker));
-        if stored == current {
-            tracing::debug!(
-                "runtime/manifest.json 已存在且 platform={} 匹配 · 跳过 bundle bootstrap",
-                current
-            );
-            return Ok(());
-        }
-        tracing::warn!(
-            "runtime/manifest.json platform 不匹配 (stored='{}' current='{}') · 仅覆盖 cpython · 保留 venvs/ 用户数据",
-            stored, current
-        );
-        // 2026-05-28 修复: 不再 remove_dir_all(&dest) · 那会清光用户已装的 venvs/
-        // 只删平台相关的 cpython/ 让 bundle 重拷 · venvs 保持原样
-        // (用户 venv 用的是相对路径 python · cpython 换了不会破)
-        for sub in ["cpython", "bin", "manifest.json"] {
-            let p = dest.join(sub);
-            if p.exists() {
-                let r = if p.is_dir() {
-                    std::fs::remove_dir_all(&p)
-                } else {
-                    std::fs::remove_file(&p)
-                };
-                if let Err(e) = r {
-                    tracing::warn!("删除 {} 失败: {} · 继续 (copy_tree 会覆盖)", p.display(), e);
-                }
-            }
-        }
-    }
-
-    // 2. bundle 里有预烘焙吗
+    // ── 1. 先定位 bundle 里的预烘焙 runtime (版本比对需先拿到 src manifest) ──
     let resource_dir = app
         .path()
         .resource_dir()
@@ -156,7 +142,8 @@ pub async fn ensure_bundled_runtime(app: &AppHandle) -> Result<()> {
             return Ok(());
         }
     };
-    if !src.join("manifest.json").exists() {
+    let src_manifest = src.join("manifest.json");
+    if !src_manifest.exists() {
         tracing::warn!(
             "bundle 有 runtime/ 但缺 manifest.json · 跳过 (烘焙可能不完整) · 路径: {}",
             src.display()
@@ -164,11 +151,56 @@ pub async fn ensure_bundled_runtime(app: &AppHandle) -> Result<()> {
         return Ok(());
     }
 
-    // 3. 拷 (2026-05-29 v8.1.4 · "装一次永久" 关键保护:
-    //         bundle 拷贝时 SKIP 用户已存在的 venv/* 子目录
-    //         OTA 升级 bundle 带新 lite/crawl venv · 不覆盖用户当前已装的)
+    // ── 2. 版本比对 · 决定 skip / 刷新 cpython / 跨架构重做 ──
+    // (旧逻辑: platform 匹配就 return → OTA 升级永不刷 cpython · 这里改为按 python/bundled_at 比对)
+    let src_id = read_manifest_identity(&src_manifest);
+    let current = normalize_platform_label(current_platform_label());
+    let marker = dest.join("manifest.json");
+    if marker.exists() {
+        let dest_id = read_manifest_identity(&marker);
+        let stored = normalize_platform_label(&dest_id.platform);
+        if stored == current {
+            // 平台一致 · 仅当 bundle 的 python / 烘焙批次变化时才刷新
+            // (升级带了新版 bundled Python → 刷 cpython · 但保留用户 venvs + installed.json 记录)
+            if src_id.python == dest_id.python && src_id.bundled_at == dest_id.bundled_at {
+                tracing::debug!(
+                    "bundled runtime 已最新 (python={} bundled_at={}) · 跳过 bootstrap",
+                    dest_id.python, dest_id.bundled_at
+                );
+                return Ok(());
+            }
+            tracing::info!(
+                "检测到更新版 bundled runtime (python {}→{} · bundled_at {}→{}) · 刷新 cpython · 保留 venvs/ 与已装 tier 记录",
+                dest_id.python, src_id.python, dest_id.bundled_at, src_id.bundled_at
+            );
+            // 删旧 cpython · 让 copy_tree 重拷新版 · venvs/ 不受影响 (用 uv 装的 python)
+            remove_bundled_cpython(&dest);
+        } else {
+            // 跨架构覆盖 (Intel↔arm / 装错平台) · 只删平台相关文件 · venvs 保持原样
+            // 2026-05-28 修复: 不再 remove_dir_all(&dest) · 那会清光用户已装的 venvs/
+            tracing::warn!(
+                "runtime/manifest.json platform 不匹配 (stored='{}' current='{}') · 仅覆盖 cpython · 保留 venvs/ 用户数据",
+                stored, current
+            );
+            for sub in ["cpython", "bin", "manifest.json"] {
+                let p = dest.join(sub);
+                if p.exists() {
+                    let r = if p.is_dir() {
+                        std::fs::remove_dir_all(&p)
+                    } else {
+                        std::fs::remove_file(&p)
+                    };
+                    if let Err(e) = r {
+                        tracing::warn!("删除 {} 失败: {} · 继续 (copy_tree 会覆盖)", p.display(), e);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 3. 拷贝 · SKIP 用户已存在的 venvs/* (装一次永久 · OTA 升级不覆盖用户已装依赖) ──
     tracing::info!(
-        "首次启动 · 拷贝预烘焙 runtime: {} → {}",
+        "拷贝预烘焙 runtime: {} → {}",
         src.display(),
         dest.display()
     );
@@ -372,7 +404,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 /// 让 v8_ws hello 能正确上报 software · executor 能找到 ffmpeg binary
 fn write_installed_meta(_dest: &PathBuf) -> Result<()> {
     use super::detector::{
-        write_installed_meta as detector_write, InstalledMeta, InstalledTier,
+        read_installed_meta, write_installed_meta as detector_write, InstalledTier,
     };
     use std::collections::BTreeMap;
 
@@ -491,13 +523,25 @@ fn write_installed_meta(_dest: &PathBuf) -> Result<()> {
         );
     }
 
-    let meta = InstalledMeta {
-        schema_version: "2".into(),
-        install_mode: "bundled".into(),
-        platform: platform_label.into(),
-        host_python: if python_bin.is_empty() { None } else { Some(python_bin) },
-        tiers,
-    };
+    // 合并写: 读现有 installed.json · 仅覆盖/插入 bundled tier (image/lite/crawl) ·
+    // 保留用户自装的 tier (ocr/speech/vision-ai 等) · 避免升级刷新后这些 tier 从上报里消失
+    // (detector_write 是整体覆盖 · 若直接构造新 meta 会丢用户 tier 记录)
+    let mut meta = read_installed_meta();
+    if meta.schema_version.is_empty() {
+        meta.schema_version = "2".into();
+    }
+    if meta.install_mode.is_empty() {
+        meta.install_mode = "bundled".into();
+    }
+    // platform 始终对齐当前 bundle (跨架构刷新后要更新)
+    meta.platform = platform_label.into();
+    if !python_bin.is_empty() {
+        meta.host_python = Some(python_bin);
+    }
+    // 用 bundled tier 覆盖同名 key · 其余 (用户自装) 原样保留
+    for (k, v) in tiers {
+        meta.tiers.insert(k, v);
+    }
 
     detector_write(&meta).map_err(|e| anyhow!("写 installed.json 失败: {}", e))
 }

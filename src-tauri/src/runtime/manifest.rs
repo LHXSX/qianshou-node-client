@@ -89,11 +89,22 @@ fn default_python_rel() -> String {
     }
 }
 
+/// 2026-05-30 · 多下载源镜像 (后台热管理)
+/// 每个 tier 可以有多个下载源 · 客户端按序尝试 · 任一成功即停止
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PrebuiltMirror {
+    pub label: String,
+    pub url: String,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub size_mb: f64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TierSpec {
     #[serde(default)]
     pub required: bool,
-    /// V8.1 · 客户端首次启动自动装此 tier · 不需用户点 · 老后端不发此字段 = false
     #[serde(default)]
     pub auto_install: bool,
     #[serde(default)]
@@ -102,42 +113,32 @@ pub struct TierSpec {
     pub packages: Vec<String>,
     #[serde(default)]
     pub pip_args: Vec<String>,
-    /// Python 自检脚本 · 一行 `import xxx; print('ok')` 之类
     #[serde(default)]
     pub smoke_test: String,
-    /// 2026-05-29 v8.1.4 · 单 tier 自检超时秒数 · 0/未设 → 走默认 60s
-    /// 大包如 paddleocr/paddlepaddle 首次 import 要初始化 + 可能下模型 · 需 180-300s
     #[serde(default)]
     pub smoke_timeout_secs: u64,
-    /// 暴露给调度器的 software 标识 · planner.py 用这个匹配
     #[serde(default)]
     pub software: Vec<String>,
-    /// 这个 tier 覆盖哪些 task_type · UI 展示用
     #[serde(default)]
     pub task_types: Vec<String>,
-    /// 装完 tier 后按列表 GET /api/v8/skills/{id}/download · 解压到本地 skills 目录
     #[serde(default)]
     pub skills: Vec<String>,
-    /// 2026-05-24 · 静态二进制 (如 ffmpeg) · 不走 pip · 直接下 OSS tarball
     #[serde(default)]
     pub binaries: Vec<BinarySpec>,
-    /// 2026-05-24 · 依赖其它 tier (例如 speech 依赖 ffmpeg) · 安装前提示用户先装
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// 2026-05-24 · 系统命令依赖 (如 blender) · 安装时 `which <cmd>` 检查 · 失败 tier 装不上
     #[serde(default)]
     pub system_commands: Vec<String>,
-    /// 2026-05-24 · 系统命令安装指引 · 探测失败时给用户复制粘贴的命令
-    /// 格式: { "macos": "brew install --cask blender", "linux": "...", "windows": "..." }
     #[serde(default)]
     pub install_hint: std::collections::BTreeMap<String, String>,
-    /// 2026-05-26 · Layer 2 自源 CDN · 优先走 (Ollama 型)
-    /// None = 后端没烘焙这个 tier · 走老路径 pip install
     #[serde(default)]
     pub prebuilt_venv: Option<PrebuiltVenvSpec>,
-    /// V8.1 (2026-05-27) · 系统二进制 (如 blender) 各平台直下 URL · 绕开 brew/winget/sudo
-    /// 格式: { "macos-arm64": { url, kind, binary, exposes, mirrors[], size_mb } }
-    /// 老后端不发此字段 = 空 map · 客户端 fallback 到 install_hint (老路径)
+    /// 2026-05-30 · 多下载源 · 后台热管理动态配置
+    #[serde(default)]
+    pub prebuilt_mirrors: Vec<PrebuiltMirror>,
+    /// 2026-05-30 · 下载源类型: self_mirror / public_mirror
+    #[serde(default)]
+    pub source_type: String,
     #[serde(default)]
     pub system_binaries: std::collections::BTreeMap<String, SystemBinarySpec>,
 }
@@ -201,17 +202,41 @@ pub fn detect_platform() -> (String, String) {
     (os, arch)
 }
 
-/// 从后端拉 manifest
-pub async fn fetch() -> Result<RuntimeManifest> {
+/// 2026-05-30 · 硬件能力快照 · 传给后端做 tier 过滤
+#[derive(Debug, Clone, Default)]
+pub struct HardwareSnapshot {
+    pub metal: bool,
+    pub cuda: bool,
+    pub gpu: bool,
+    pub vram_gb: f32,
+    pub ram_gb: f32,
+}
+
+/// 从后端拉 manifest · 传入硬件参数用于过滤不适配的 tier
+pub async fn fetch(hw: &HardwareSnapshot) -> Result<RuntimeManifest> {
     let (os, arch) = detect_platform();
-    // 2026-05-27 · region=auto · 服务端按请求 IP 自动判断 cn/intl · 给镜像源排序
-    // 海外用户先试 pypi.org · 国内先试阿里云 · 避免错排导致 3 × 180s 超时
-    let url = format!(
+    let mut url = format!(
         "{}/api/v8/runtime/manifest?os={}&arch={}&region=auto",
         api_base(),
         os,
         arch
     );
+    // 2026-05-30 · 附加硬件参数 · 后端据此过滤不适合本机的 tier
+    if hw.metal {
+        url.push_str("&metal=true");
+    }
+    if hw.cuda {
+        url.push_str("&cuda=true");
+    }
+    if hw.gpu {
+        url.push_str("&gpu=true");
+    }
+    if hw.vram_gb > 0.0 {
+        url.push_str(&format!("&vram_gb={:.1}", hw.vram_gb));
+    }
+    if hw.ram_gb > 0.0 {
+        url.push_str(&format!("&ram_gb={:.1}", hw.ram_gb));
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .user_agent(format!("EdgeCompute-Client/{}", env!("CARGO_PKG_VERSION")))

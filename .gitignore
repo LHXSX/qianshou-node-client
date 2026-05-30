@@ -57,6 +57,7 @@ src-tauri/.cargo/
 #   保留: resources/{bin,runtime}/README.md (说明用 · ! 取反)
 src-tauri/resources/runtime/cpython/
 src-tauri/resources/runtime/envs/
+src-tauri/resources/runtime/venvs/
 src-tauri/resources/runtime/manifest.json
 src-tauri/resources/bin/uv-*
 src-tauri/resources/bin/uv.exe

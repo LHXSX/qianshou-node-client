@@ -5,20 +5,14 @@ name: Windows Client Build (v8.1.4+)
 # 产物: .exe (NSIS 安装包) + .nsis.zip (OTA) + .sig (签名)
 
 on:
+  # 仅手动触发 · tag v* 由 build-tauri-multi-platform 统一构建 (避免抢同一 Release)
+  # 本 workflow 用于"只想快速重出 win 包"的场景 (~3min · 不连带 mac)
   workflow_dispatch:
     inputs:
       publish_release:
         description: '是否发布到 GitHub Releases (true/false)'
         required: false
         default: 'true'
-  push:
-    tags:
-      - 'v*'
-    branches:
-      - main
-    paths:
-      - 'client-v3-latest/**'
-      - '.github/workflows/build-windows.yml'
 
 permissions:
   contents: write
@@ -41,7 +35,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: client-v3-latest/package-lock.json
+          cache-dependency-path: package-lock.json
 
       # ── 3. Rust stable + Windows target ──
       - uses: dtolnay/rust-toolchain@stable
@@ -51,18 +45,18 @@ jobs:
       # ── 4. Rust 缓存 ──
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: './client-v3-latest/src-tauri -> target'
+          workspaces: './src-tauri -> target'
 
       # ── 5. 安装前端依赖 ──
       - name: Install frontend deps
-        run: cd client-v3-latest && npm ci
+        run: npm ci
 
-      # ── 6. Prebake runtime (cpython + uv + lite/crawl venv) ──
+      # ── 6. Prebake runtime (cpython + uv · 不含 venv · V8.1.5) ──
       # 关键: 不跑 prebake 会导致 Windows 包内嵌 mac-arm64 二进制 → 安装失败
+      # venv 首启从自家镜像/公共源装 · 安装包仅 ~87MB
       - name: Prebake runtime
         shell: bash
         run: |
-          cd client-v3-latest
           bash scripts/prebake-runtime.sh windows-x64
           echo ""
           echo "=== resources 目录确认 ==="
@@ -73,7 +67,6 @@ jobs:
       # ── 7. Tauri build (NSIS only, MSI 已废弃) ──
       - name: Build Tauri app
         run: |
-          cd client-v3-latest
           npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
@@ -83,7 +76,7 @@ jobs:
       - name: Rename artifacts to ASCII
         shell: bash
         run: |
-          cd client-v3-latest/src-tauri/target
+          cd src-tauri/target
           find . -path '*/release/bundle/*' -name '*千手*' -print0 | while IFS= read -r -d '' f; do
             new="$(echo "$f" | sed 's/千手/Qianshou/g')"
             if [ "$f" != "$new" ]; then
@@ -99,10 +92,10 @@ jobs:
         with:
           name: tauri-windows-x64
           path: |
-            client-v3-latest/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-            client-v3-latest/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
-            client-v3-latest/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.nsis.zip
-            client-v3-latest/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.nsis.zip.sig
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.nsis.zip
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.nsis.zip.sig
           retention-days: 30
           if-no-files-found: warn
 
@@ -115,7 +108,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: client-v3-latest/package.json
+          sparse-checkout: package.json
           sparse-checkout-cone-mode: false
 
       - uses: actions/download-artifact@v4
@@ -134,7 +127,7 @@ jobs:
             VER="${{ github.ref_name }}"
             VER="${VER#v}"
           else
-            VER=$(node -p "require('./client-v3-latest/package.json').version")
+            VER=$(node -p "require('./package.json').version")
           fi
           echo "VERSION=$VER" >> $GITHUB_OUTPUT
           echo "Version: $VER"
@@ -183,7 +176,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: client-v3-latest/package.json
+          sparse-checkout: package.json
           sparse-checkout-cone-mode: false
 
       - uses: actions/download-artifact@v4

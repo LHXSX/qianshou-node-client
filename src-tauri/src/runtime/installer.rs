@@ -83,7 +83,7 @@ pub async fn install_tier(app: AppHandle, tier: String) -> Result<String> {
 
 async fn run_install(job_id: &str, tier: &str, app: &AppHandle) -> Result<()> {
     emit_log(app, job_id, tier, "▶ 拉取后端运行时清单…", false);
-    let m = manifest::fetch().await?;
+    let m = manifest::fetch(&Default::default()).await?;
     emit_log(
         app,
         job_id,
@@ -111,22 +111,32 @@ async fn run_install(job_id: &str, tier: &str, app: &AppHandle) -> Result<()> {
         return run_install_system_check_only(job_id, tier, app, &m, &spec).await;
     }
 
-    // 2026-05-26 · Layer 2 自源 CDN 优先 (Ollama 型 · 跳过 PyPI)
-    // 后端 manifest 配了 prebuilt_venv → 优先拉 tarball + 校验 + 解压
-    // 成功就直接 done · 失败 emit warn + 走下面老路径 (pip + 4 镜像)
+    // V8.1.5 · 自家镜像优先 + 公共源兜底 (双保险)
+    // 后端 manifest 配了 prebuilt_venv → 拉 tarball + 校验 + 解压 (快路 · 稳 100x)
+    // 失败时:
+    //   - 有 packages + public_mirror_venv + mirrors → 降级公共源 pip (继续往下走 · 不掉线)
+    //   - 否则 (纯 tarball tier · 无 pip 可装) → 报错让用户重试
+    // 设计依据: 镜像可能某平台 tarball 缺失/损坏 · 公共源 pip 全平台可用 · 不能让节点卡死
     if let Some(pv) = spec.prebuilt_venv.clone() {
         emit_log(app, job_id, tier,
-            &format!("▶ 检测到预打包源 · 优先走 OSS tarball ({} MB · {})",
-                pv.size_mb, pv.version), false);
+            &format!("▶ 从自家镜像下载预打包 venv · {} ({} MB)",
+                pv.version, pv.size_mb), false);
         match install_prebuilt_venv(job_id, tier, app, &m, &spec, &pv).await {
-            Ok(()) => {
-                emit_log(app, job_id, tier, "✅ 预打包源安装成功 · 跳过 PyPI", false);
-                return Ok(());
-            }
+            Ok(()) => return Ok(()),
             Err(e) => {
-                emit_log(app, job_id, tier,
-                    &format!("⚠ 预打包源失败 · 降级到 PyPI 公共源: {}", e), true);
-                // 不 return · 继续走下面的老路径
+                let can_fallback = !spec.packages.is_empty()
+                    && m.install_mode == "public_mirror_venv"
+                    && !m.mirrors.is_empty();
+                if can_fallback {
+                    emit_log(app, job_id, tier,
+                        &format!("⚠ 自家镜像安装失败 · 降级公共源 pip 重试: {}", e), true);
+                    // 不 return · 继续往下走 uv + pip 公共源流程 (会自动清理半残 venv 目录)
+                } else {
+                    return Err(anyhow!(
+                        "从自家镜像安装 {} 失败 · 无公共源兜底条件 (packages={} mirrors={} mode={}) · \
+                         请检查网络后点重试: {}",
+                        tier, spec.packages.len(), m.mirrors.len(), m.install_mode, e));
+                }
             }
         }
     }
@@ -500,21 +510,53 @@ async fn install_prebuilt_venv(
         let _ = std::fs::remove_dir_all(&venv_dest);
     }
 
-    // 3. 下载 tarball 到临时文件
-    emit_log(app, job_id, tier,
-        &format!("▶ 下载 prebuilt venv · {}", pv.url), false);
+    // 3. 多源下载 tarball · 主 URL 优先 · 失败后依次尝试 mirror_sources
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1800))  // 30 min · 大包 (vision-ai 可能 3GB)
+        .timeout(Duration::from_secs(1800))
         .user_agent(format!("EdgeCompute-Client/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| anyhow!("reqwest client 失败: {}", e))?;
     let tmpdir = tempfile::tempdir().map_err(|e| anyhow!("tempdir 失败: {}", e))?;
     let archive_path = tmpdir.path().join("venv.tar.gz");
-    download_to_file(&client, &pv.url, &archive_path).await
-        .map_err(|e| anyhow!("下载 prebuilt venv 失败: {}", e))?;
-    let bytes = std::fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
-    emit_log(app, job_id, tier,
-        &format!("✓ 下载完成 · {:.1} MB", bytes as f64 / 1024.0 / 1024.0), false);
+
+    // 构建下载 URL 列表: 主 URL → mirrors (按序)
+    let mut urls: Vec<(String, String)> = vec![
+        ("自家镜像".into(), pv.url.clone()),
+    ];
+    for m in &spec.prebuilt_mirrors {
+        if !m.url.is_empty() {
+            urls.push((m.label.clone(), m.url.clone()));
+        }
+    }
+
+    let mut last_err = String::from("无可用下载源");
+    for (i, (label, url)) in urls.iter().enumerate() {
+        let source_tag = if i == 0 {
+            format!("{} (主)", label)
+        } else {
+            format!("{} (镜像 #{}", label, i)
+        };
+        emit_log(app, job_id, tier,
+            &format!("▶ 下载 prebuilt venv · {}", source_tag), false);
+        match download_to_file(&client, url, &archive_path).await {
+            Ok(()) => {
+                let bytes = std::fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
+                emit_log(app, job_id, tier,
+                    &format!("✓ 下载完成 · {} · {:.1} MB", source_tag, bytes as f64 / 1024.0 / 1024.0), false);
+                last_err.clear();
+                break;
+            }
+            Err(e) => {
+                let msg = format!("✗ 下载失败 · {}: {}", source_tag, e);
+                emit_log(app, job_id, tier, &msg, true);
+                last_err = msg;
+                let _ = std::fs::remove_file(&archive_path);
+            }
+        }
+    }
+    if !last_err.is_empty() {
+        return Err(anyhow!("所有下载源均失败: {}", last_err));
+    }
 
     // 4. sha256 校验 (TBD 跳过 · 给 warn)
     if pv.sha256.trim().is_empty() || pv.sha256.eq_ignore_ascii_case("TBD") {

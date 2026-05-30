@@ -12,10 +12,19 @@ use serde::Serialize;
 use tauri::AppHandle;
 
 use super::{detector, installer, manifest};
+use crate::hardware_capabilities;
 
 #[tauri::command]
 pub async fn runtime_fetch_manifest() -> Result<manifest::RuntimeManifest, String> {
-    manifest::fetch().await.map_err(|e| e.to_string())
+    let caps = hardware_capabilities::detect();
+    let hw = manifest::HardwareSnapshot {
+        metal: caps.supports_metal,
+        cuda: caps.supports_cuda,
+        gpu: caps.supports_metal || caps.supports_cuda || caps.supports_rocm,
+        vram_gb: caps.gpu_vram_gb,
+        ram_gb: 0.0,  // TODO: 跨平台总内存探测 · sysctl/meminfo
+    };
+    manifest::fetch(&hw).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -39,9 +39,27 @@ fn bundled_uv_filename() -> &'static str {
     { "uv" }
 }
 
-/// HTTP fallback URL · 没 bundle 时下这个
-fn fallback_uv_url() -> &'static str {
-    // uv 0.11.x · 稳定版 · 后续可以让后端 manifest 下发动态版本
+/// 自家镜像 uv 直链 (raw binary · 不经压缩)
+fn self_mirror_uv_url() -> &'static str {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    { "https://by.wujisuanli.com/v1/macos-arm64/uv" }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    { "https://by.wujisuanli.com/v1/macos-x86_64/uv" }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    { "https://by.wujisuanli.com/v1/windows-x86_64/uv.exe" }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    { "https://by.wujisuanli.com/v1/linux-x86_64/uv" }
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+    )))]
+    { "" }
+}
+
+/// GitHub fallback URL · 自家镜像挂了走这个
+fn github_uv_url() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     { "https://github.com/astral-sh/uv/releases/download/0.11.15/uv-aarch64-apple-darwin.tar.gz" }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -90,41 +108,89 @@ pub async fn ensure_uv(app: &AppHandle) -> Result<PathBuf> {
         }
     }
 
-    // 3) HTTP 下载 fallback (后续可走自家镜像)
+    // 3) HTTP 下载 · 自家镜像优先 · GitHub 兜底
     download_uv(&uv).await?;
     ensure_executable(&uv)?;
     verify_uv(&uv).await?;
     Ok(uv)
 }
 
-/// HTTP 下载 uv (从 GitHub Release)
+/// HTTP 下载 uv · 自家镜像优先 (raw binary) · GitHub 兜底 (tar.gz/zip)
 async fn download_uv(dest: &Path) -> Result<()> {
-    let url = fallback_uv_url();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| anyhow!("初始化 http 失败: {}", e))?;
+
+    let parent = paths::uv_bin_dir();
+
+    // 源1: 自家镜像 raw binary · 直接下就是可执行文件
+    let mirror_url = self_mirror_uv_url();
+    if !mirror_url.is_empty() {
+        tracing::info!("下载 uv · 尝试自家镜像: {}", mirror_url);
+        match download_raw_binary(&client, mirror_url, dest).await {
+            Ok(()) => {
+                tracing::info!("uv 自家镜像下载成功");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!("自家镜像 uv 下载失败 ({}): {} · 试 GitHub 兜底", mirror_url, e);
+            }
+        }
+    }
+
+    // 源2: GitHub archive · 需要解压
+    let github_url = github_uv_url();
+    tracing::info!("下载 uv · GitHub 兜底: {}", github_url);
     let bytes = client
-        .get(url)
+        .get(github_url)
         .send()
         .await
-        .map_err(|e| anyhow!("下载 uv 失败 ({}): {}", url, e))?
+        .map_err(|e| anyhow!("下载 uv 失败 ({}): {}", github_url, e))?
         .error_for_status()
-        .map_err(|e| anyhow!("uv 下载响应非 2xx: {}", e))?
+        .map_err(|e| anyhow!("uv GitHub 响应非 2xx: {}", e))?
         .bytes()
         .await
         .map_err(|e| anyhow!("读取 uv 字节流失败: {}", e))?;
 
-    // 临时文件 → 解压 → 拷出 uv 二进制
-    let tmp_archive = paths::uv_bin_dir().join("uv-download.tmp");
+    let ext = if github_url.ends_with(".tar.gz") {
+        "tar.gz"
+    } else if github_url.ends_with(".tgz") {
+        "tgz"
+    } else if github_url.ends_with(".zip") {
+        "zip"
+    } else {
+        return Err(anyhow!("无法从 URL 推断 uv archive 格式: {}", github_url));
+    };
+    let tmp_archive = parent.join(format!("uv-download.{}", ext));
     std::fs::write(&tmp_archive, &bytes)
         .map_err(|e| anyhow!("写下载临时文件失败: {}", e))?;
 
-    let parent = paths::uv_bin_dir();
     let extracted = extract_uv_archive(&tmp_archive, &parent)?;
     std::fs::rename(&extracted, dest)
         .map_err(|e| anyhow!("rename uv ({} → {}) 失败: {}", extracted.display(), dest.display(), e))?;
     let _ = std::fs::remove_file(&tmp_archive);
+    Ok(())
+}
+
+/// 直接下载 raw binary (无压缩 · 自家镜像用)
+async fn download_raw_binary(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
+    let bytes = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("下载 raw uv 失败 ({}): {}", url, e))?
+        .error_for_status()
+        .map_err(|e| anyhow!("raw uv 响应非 2xx: {}", e))?
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("读取 raw uv 字节流失败: {}", e))?;
+
+    if bytes.len() < 1024 * 1024 {
+        return Err(anyhow!("raw uv 文件太小 ({} bytes) · 可能下载不完整", bytes.len()));
+    }
+    std::fs::write(dest, &bytes)
+        .map_err(|e| anyhow!("写 raw uv 二进制失败 ({}): {}", dest.display(), e))?;
     Ok(())
 }
 
