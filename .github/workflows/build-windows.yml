@@ -72,20 +72,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
 
-      # ── 8. 重命名产物 (中文 → ASCII, 避免 URL 编码问题) ──
-      - name: Rename artifacts to ASCII
-        shell: bash
-        run: |
-          cd src-tauri/target
-          find . -path '*/release/bundle/*' -name '*千手*' -print0 | while IFS= read -r -d '' f; do
-            new="$(echo "$f" | sed 's/千手/Qianshou/g')"
-            if [ "$f" != "$new" ]; then
-              mv "$f" "$new"
-              echo "renamed: $(basename "$f") → $(basename "$new")"
-            fi
-          done
-
-      # ── 9. 上传构建产物 ──
+      # ── 8. 上传构建产物 (保留 千手节点 原名 · 与 binary.json/release.json 一致) ──
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         if: always()
