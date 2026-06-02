@@ -69,30 +69,28 @@ chmod 0755 "$TESS_DIR/tesseract"
 # 系统库(/usr/lib /System)保持原样不拷;其余(/opt/homebrew /usr/local/Cellar 等)
 # 递归拷进 libs/ 并把所有引用 install_name_tool 改成 @executable_path/libs/<basename>。
 echo "[2/5] 重定位 dylib(@executable_path/libs/)"
-is_system_lib() { [[ "$1" == /usr/lib/* || "$1" == /System/* ]]; }
+# 注意: macOS 自带 /bin/bash 仍是 3.2(无 declare -A 关联数组)· 用"dest 文件是否已存在"
+# 做去重(basename 在 tesseract/leptonica 依赖里唯一),普通索引数组做 BFS 队列(3.2 兼容)。
+is_system_lib() { case "$1" in /usr/lib/*|/System/*) return 0;; *) return 1;; esac; }
 
-declare -A COPIED=()      # 绝对路径 → 已处理标记
 QUEUE=("$TESS_DIR/tesseract")
 
-# 先把主二进制对自身的引用清掉(可执行无需 -id)
+# 把 target 的全部非系统依赖改写成 @executable_path/libs/,并把依赖本体拷进 libs/ 入队递归
 process_refs() {
   local target="$1"
-  # otool -L 第一行是文件名自身,跳过;dylib 第二行常是其 LC_ID
-  local deps
+  # otool -L 第一行是文件名自身(跳过);dylib 第二行是其 LC_ID(已改写后以 @ 开头会被跳过)
+  local deps dep base dest_lib
   deps="$(otool -L "$target" 2>/dev/null | tail -n +2 | awk '{print $1}')"
   while IFS= read -r dep; do
-    [[ -z "$dep" ]] && continue
-    # 跳过已是 @executable_path / @loader_path / @rpath 的(理论上重写后会出现)
-    [[ "$dep" == @* ]] && continue
+    [ -z "$dep" ] && continue
+    case "$dep" in @*) continue;; esac        # 已是 @executable_path/@loader_path/@rpath
     is_system_lib "$dep" && continue
-    local base; base="$(basename "$dep")"
-    local dest_lib="$LIBS_DIR/$base"
-    # 把引用改成可重定位路径
+    base="$(basename "$dep")"
+    dest_lib="$LIBS_DIR/$base"
     install_name_tool -change "$dep" "@executable_path/libs/$base" "$target" 2>/dev/null || true
-    # 拷贝依赖本体(若尚未拷)并入队递归
-    if [[ -z "${COPIED[$dep]:-}" ]]; then
-      COPIED["$dep"]=1
-      if [[ -f "$dep" ]]; then
+    # dest 已存在即代表此依赖已拷贝并入队过 → 跳过(去重 + 防环)
+    if [ ! -e "$dest_lib" ]; then
+      if [ -f "$dep" ]; then
         cp -f "$dep" "$dest_lib" 2>/dev/null || true
         chmod 0644 "$dest_lib" 2>/dev/null || true
         install_name_tool -id "@executable_path/libs/$base" "$dest_lib" 2>/dev/null || true
