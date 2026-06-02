@@ -545,3 +545,109 @@ fn write_installed_meta(_dest: &PathBuf) -> Result<()> {
 
     detector_write(&meta).map_err(|e| anyhow!("写 installed.json 失败: {}", e))
 }
+
+/// 8.1.6 · Windows OCR 内置 · 解决 "Win OCR 依赖缺陷"
+///
+/// 背景: `ocr-tools-v1` 的 Python 依赖(pytesseract+Pillow)各平台 pip 可装,真正缺的是
+///       原生 `tesseract` 二进制 —— Windows 节点无内置。本函数把 bundle 的
+///       `resources/ocr/`(tesseract.exe + tessdata,由 scripts/prebake-ocr-windows.sh 烘焙)
+///       拷到 `~/.qianshou/runtime/tiers/ocr/` 并注册 ocr tier(binaries{tesseract}) ·
+///       executor 据此把 tesseract 目录注入子进程 PATH + 设 TESSDATA_PREFIX ·
+///       pytesseract 调 tesseract 即开箱即用,0 装机 0 网络。
+///
+/// 门控: 仅当 bundle 含 `resources/ocr/manifest.json` 时激活(Windows build 才烘焙) ·
+///       macOS/Linux 缺该目录 → 静默跳过,沿用镜像 tier/系统 tesseract → 零回归。
+pub async fn ensure_bundled_ocr(app: &AppHandle) -> Result<()> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| anyhow!("无法解析 resource_dir: {}", e))?;
+    let candidates = [
+        resource_dir.join("resources").join("ocr"),
+        resource_dir.join("ocr"),
+    ];
+    let src = match candidates.iter().find(|p| p.join("manifest.json").exists()) {
+        Some(p) => p.clone(),
+        None => {
+            tracing::debug!("bundle 无内置 OCR · 跳过(走镜像 tier/系统 tesseract)");
+            return Ok(());
+        }
+    };
+
+    let dest = paths::tier_root("ocr");
+    let exe_rel = if cfg!(windows) {
+        "tesseract/tesseract.exe"
+    } else {
+        "tesseract/tesseract"
+    };
+    let dest_exe = dest.join(exe_rel);
+
+    if !dest_exe.exists() {
+        tracing::info!(
+            "拷贝内置 OCR(tesseract+tessdata): {} → {}",
+            src.display(),
+            dest.display()
+        );
+        std::fs::create_dir_all(&dest).ok();
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        copy_tree_with_skip(&src, &dest, "", &empty)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if dest_exe.exists() {
+                let _ = std::fs::set_permissions(
+                    &dest_exe,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+        }
+    }
+
+    if !dest_exe.exists() {
+        tracing::warn!(
+            "内置 OCR 拷贝后未见 tesseract 可执行: {} · 跳过 tier 注册",
+            dest_exe.display()
+        );
+        return Ok(());
+    }
+
+    register_ocr_tier(&dest_exe);
+    tracing::info!("✅ 内置 OCR 就绪 · ocr tier 已注册(binaries.tesseract={})", dest_exe.display());
+    Ok(())
+}
+
+/// 把内置 tesseract 注册为 ocr tier(merge 写 installed.json · 不动其它 tier)。
+/// software 只声明 `tesseract`(原生二进制就绪);pytesseract+pillow 由常规 tier 安装上报。
+fn register_ocr_tier(tesseract_exe: &Path) {
+    use super::detector::{
+        read_installed_meta, write_installed_meta as detector_write, InstalledTier,
+    };
+    use std::collections::BTreeMap;
+
+    let mut binaries: BTreeMap<String, String> = BTreeMap::new();
+    binaries.insert(
+        "tesseract".into(),
+        tesseract_exe.to_string_lossy().into_owned(),
+    );
+
+    let tier = InstalledTier {
+        ok: true,
+        python: String::new(),
+        packages: vec!["tesseract".into()],
+        software: vec!["tesseract".into()],
+        mirror_label: "bundled".into(),
+        installed_at: chrono::Utc::now().to_rfc3339(),
+        last_message: "Windows 内置 OCR · tesseract + tessdata 开箱即用 · 0 装机 0 网络".into(),
+        binaries,
+        installed_skills: BTreeMap::new(),
+    };
+
+    let mut meta = read_installed_meta();
+    if meta.schema_version.is_empty() {
+        meta.schema_version = "2".into();
+    }
+    meta.tiers.insert("ocr".into(), tier);
+    if let Err(e) = detector_write(&meta) {
+        tracing::warn!("写 ocr tier 到 installed.json 失败: {}", e);
+    }
+}

@@ -702,6 +702,16 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<(String, i32
                 command.env("EC_TIER_BINARIES_JSON", j);
             }
         }
+        // 8.1.6 · Win OCR 内置 · ocr tier 的 tesseract 目录已随上面 binaries→PATH 注入
+        //   (pytesseract 默认即可找到 tesseract) · 这里补 TESSDATA_PREFIX 让 tesseract
+        //   找到 chi_sim/eng 语言包,并暴露 EC_TESSERACT 绝对路径兜底。
+        if let Some(tess) = all_binaries.get("tesseract") {
+            command.env("EC_TESSERACT", tess);
+            let ocr_root = crate::runtime::paths::tier_root("ocr");
+            if ocr_root.join("tessdata").is_dir() {
+                command.env("TESSDATA_PREFIX", &ocr_root);
+            }
+        }
     }
     // 4c. 内置 runtime 用 PYTHONPATH 喂第三方包 (envs/*/lib/python3.11/site-packages)
     //     合并已有 PYTHONPATH (用户/系统级) · 用 OS path separator

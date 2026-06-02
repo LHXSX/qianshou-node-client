@@ -64,6 +64,25 @@ jobs:
           ls -la src-tauri/resources/bin/ || true
           cat src-tauri/resources/runtime/manifest.json
 
+      # ── 6b. Prebake OCR (tesseract + tessdata · 8.1.6 Win 内置 · 解决 OCR 依赖缺陷) ──
+      # choco 装 tesseract(含 tesseract.exe + DLL + eng tessdata)→ 复制进 resources/ocr/,
+      # chi_sim 从公共源补。客户端 bootstrap 据 manifest.json 注册 ocr tier,executor 注入
+      # PATH + TESSDATA_PREFIX → pytesseract 调 tesseract 开箱即用,0 装机 0 网络。
+      - name: Prebake OCR (tesseract + tessdata)
+        shell: bash
+        run: |
+          choco install tesseract --no-progress -y
+          TESS_DIR="/c/Program Files/Tesseract-OCR"
+          if [ ! -f "$TESS_DIR/tesseract.exe" ]; then
+            FOUND="$(find /c -iname tesseract.exe 2>/dev/null | head -1)"
+            [ -n "$FOUND" ] && TESS_DIR="$(dirname "$FOUND")"
+          fi
+          echo "tesseract install dir: $TESS_DIR"
+          TESS_LOCAL_DIR="$TESS_DIR" bash scripts/prebake-ocr-windows.sh
+          echo "=== resources/ocr 确认 ==="
+          ls -la src-tauri/resources/ocr/ || true
+          ls -la src-tauri/resources/ocr/tessdata/ || true
+
       # ── 7. Tauri build (NSIS only, MSI 已废弃) ──
       - name: Build Tauri app
         run: |

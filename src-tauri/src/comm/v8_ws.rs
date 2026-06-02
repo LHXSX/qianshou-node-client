@@ -451,6 +451,38 @@ fn enqueue_result_to_disk(payload: &ShardResultPayload) {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Phase5 (2026-06-02) · shard_id 客户端幂等去重
+//   多网关下服务端可能对同一 shard 重复下发 (recover 重发 / 跨进程接力)。
+//   旧逻辑收到重复 → abort 正在跑的任务再重启 → 子进程被中途杀 + 二次 spawn 冲突
+//   → exit code 1 / 临时目录损坏。改为: 已在跑 / 窗口内已完成 → 直接忽略重复派发。
+//   服务端已按 shard_id 对 shard_result 幂等去重 · 忽略重复绝对安全。
+// ════════════════════════════════════════════════════════════════════
+const SHARD_DEDUP_WINDOW_SECS: u64 = 180;
+
+fn recent_done_guard() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static G: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    G.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn mark_shard_done(shard_id: &str) {
+    if let Ok(mut m) = recent_done_guard().lock() {
+        let now = Instant::now();
+        m.retain(|_, t| now.duration_since(*t).as_secs() < SHARD_DEDUP_WINDOW_SECS);
+        m.insert(shard_id.to_string(), now);
+    }
+}
+
+fn shard_recently_done(shard_id: &str) -> bool {
+    if let Ok(m) = recent_done_guard().lock() {
+        if let Some(t) = m.get(shard_id) {
+            return Instant::now().duration_since(*t).as_secs() < SHARD_DEDUP_WINDOW_SECS;
+        }
+    }
+    false
+}
+
 /// W1-7 · 抽出 spawn 逻辑 · shard_assign 和 pull_assign 共用
 /// (跟原 shard_assign 处理一致 · 只是抽成函数复用)
 async fn spawn_shard_task(
@@ -469,15 +501,25 @@ async fn spawn_shard_task(
     let active_for_task = active_shards.clone();
     let shard_id_for_task = shard_id.clone();
 
-    let handle = tokio::spawn(async move {
-        if let Err(e) = run_shard_task(assign, &tx, &state_clone, &app_clone, &wid).await {
-            tracing::warn!("v8.shard_task · {}", e);
+    // Phase5 幂等去重 · 持锁完成"判重 + 占位"避免竞态
+    {
+        let mut guard = active_shards.lock().await;
+        if guard.contains_key(&shard_id) {
+            tracing::warn!("v8.ws · shard={} 重复派发 · 已在运行 · 忽略 (幂等)", shard_id);
+            return;
         }
-        active_for_task.lock().await.remove(&shard_id_for_task);
-    });
-    if let Some(old) = active_shards.lock().await.insert(shard_id.clone(), handle) {
-        tracing::warn!("v8.ws · shard={} 重复派发 · abort old handle", shard_id);
-        old.abort();
+        if shard_recently_done(&shard_id) {
+            tracing::warn!("v8.ws · shard={} 重复派发 · 窗口内已完成 · 忽略 (幂等)", shard_id);
+            return;
+        }
+        let handle = tokio::spawn(async move {
+            if let Err(e) = run_shard_task(assign, &tx, &state_clone, &app_clone, &wid).await {
+                tracing::warn!("v8.shard_task · {}", e);
+            }
+            mark_shard_done(&shard_id_for_task);
+            active_for_task.lock().await.remove(&shard_id_for_task);
+        });
+        guard.insert(shard_id.clone(), handle);
     }
 }
 

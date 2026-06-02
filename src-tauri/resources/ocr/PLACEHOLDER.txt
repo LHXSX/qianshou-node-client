@@ -1,0 +1,9 @@
+OCR 内置占位文件 (8.1.6)
+
+此目录在 Windows 构建时由 scripts/prebake-ocr-windows.sh 填充:
+  tesseract/tesseract.exe + 依赖 DLL
+  tessdata/{eng,chi_sim}.traineddata
+  manifest.json   ← 客户端 bootstrap_bundled::ensure_bundled_ocr 据此(存在即激活)注册 ocr tier
+
+非 Windows 构建保留本占位文件即可(tauri bundle.resources 的 glob 需至少匹配一个文件)。
+缺少 manifest.json 时客户端静默跳过 OCR 内置 → 走镜像 tier/系统 tesseract,零回归。

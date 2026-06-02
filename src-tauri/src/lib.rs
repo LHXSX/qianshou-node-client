@@ -190,6 +190,10 @@ pub fn run() {
                 if let Err(e) = runtime::bootstrap_bundled::ensure_bundled_runtime(&app_handle).await {
                     tracing::warn!("bootstrap_bundled 失败: {} (走老 uv install 路径)", e);
                 }
+                // 8.1.6 · Windows OCR 内置(bundle 含 resources/ocr/ 才激活 · 缺失静默跳过)
+                if let Err(e) = runtime::bootstrap_bundled::ensure_bundled_ocr(&app_handle).await {
+                    tracing::warn!("ensure_bundled_ocr 失败: {} (OCR 走镜像 tier/系统 tesseract)", e);
+                }
             });
 
             // V8.1 (2026-05-27) · 首启自动装 manifest.tiers 标 auto_install=true 的 tier
