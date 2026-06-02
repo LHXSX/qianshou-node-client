@@ -702,7 +702,7 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<(String, i32
                 command.env("EC_TIER_BINARIES_JSON", j);
             }
         }
-        // 8.1.6 · Win OCR 内置 · ocr tier 的 tesseract 目录已随上面 binaries→PATH 注入
+        // 8.1.6 · 内置 OCR(双端)· ocr tier 的 tesseract 目录已随上面 binaries→PATH 注入
         //   (pytesseract 默认即可找到 tesseract) · 这里补 TESSDATA_PREFIX 让 tesseract
         //   找到 chi_sim/eng 语言包,并暴露 EC_TESSERACT 绝对路径兜底。
         if let Some(tess) = all_binaries.get("tesseract") {

@@ -134,6 +134,20 @@ jobs:
           ls -la src-tauri/resources/ocr/ || true
           ls -la src-tauri/resources/ocr/tessdata/ || true
 
+      # 6.7 · prebake OCR (仅 mac arm64 · 8.1.6 内置可重定位 tesseract · 解决 OCR 依赖缺陷)
+      #
+      # runner 为 arm64 → 只给 macos-arm64 包内置(装的是 arm64 tesseract);macos-intel
+      # 塞 arm64 二进制会跑不动 → 不内置,静默回退系统/镜像 tesseract(零回归)。
+      # 脚本自带 --version 自检:重定位失败则删 manifest → 客户端静默回退,绝不出坏包。
+      - name: prebake OCR (macos-arm64 only)
+        if: matrix.label == 'macos-arm64'
+        shell: bash
+        run: |
+          bash scripts/prebake-ocr-macos.sh || echo "(mac OCR prebake 跳过/失败 · 回退系统 tesseract · 不阻断构建)"
+          echo "=== resources/ocr 确认 ==="
+          ls -la src-tauri/resources/ocr/ || true
+          ls -la src-tauri/resources/ocr/tessdata/ 2>/dev/null || true
+
       # 7 · Tauri 一键 build + 自动签名 + (可选) 上传到 Releases
       - name: build & publish
         uses: tauri-apps/tauri-action@v0

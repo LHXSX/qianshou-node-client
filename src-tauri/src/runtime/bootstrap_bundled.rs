@@ -546,17 +546,18 @@ fn write_installed_meta(_dest: &PathBuf) -> Result<()> {
     detector_write(&meta).map_err(|e| anyhow!("写 installed.json 失败: {}", e))
 }
 
-/// 8.1.6 · Windows OCR 内置 · 解决 "Win OCR 依赖缺陷"
+/// 8.1.6 · 内置 OCR(双端)· 解决 "OCR 依赖缺陷"
 ///
 /// 背景: `ocr-tools-v1` 的 Python 依赖(pytesseract+Pillow)各平台 pip 可装,真正缺的是
-///       原生 `tesseract` 二进制 —— Windows 节点无内置。本函数把 bundle 的
-///       `resources/ocr/`(tesseract.exe + tessdata,由 scripts/prebake-ocr-windows.sh 烘焙)
-///       拷到 `~/.qianshou/runtime/tiers/ocr/` 并注册 ocr tier(binaries{tesseract}) ·
+///       原生 `tesseract` 二进制 —— 节点无内置。本函数把 bundle 的 `resources/ocr/`
+///       (Win: tesseract.exe + DLL,由 prebake-ocr-windows.sh 烘焙;mac: 可重定位
+///       tesseract + libs,由 prebake-ocr-macos.sh 烘焙;均含 tessdata)拷到
+///       `~/.qianshou/runtime/tiers/ocr/` 并注册 ocr tier(binaries{tesseract}) ·
 ///       executor 据此把 tesseract 目录注入子进程 PATH + 设 TESSDATA_PREFIX ·
 ///       pytesseract 调 tesseract 即开箱即用,0 装机 0 网络。
 ///
-/// 门控: 仅当 bundle 含 `resources/ocr/manifest.json` 时激活(Windows build 才烘焙) ·
-///       macOS/Linux 缺该目录 → 静默跳过,沿用镜像 tier/系统 tesseract → 零回归。
+/// 门控: 仅当 bundle 含 `resources/ocr/manifest.json` 时激活(Win + mac arm64 build 才烘焙) ·
+///       mac Intel/Linux 缺该目录 → 静默跳过,沿用镜像 tier/系统 tesseract → 零回归。
 pub async fn ensure_bundled_ocr(app: &AppHandle) -> Result<()> {
     let resource_dir = app
         .path()
@@ -637,7 +638,7 @@ fn register_ocr_tier(tesseract_exe: &Path) {
         software: vec!["tesseract".into()],
         mirror_label: "bundled".into(),
         installed_at: chrono::Utc::now().to_rfc3339(),
-        last_message: "Windows 内置 OCR · tesseract + tessdata 开箱即用 · 0 装机 0 网络".into(),
+        last_message: "客户端内置 OCR · tesseract + tessdata 开箱即用 · 0 装机 0 网络".into(),
         binaries,
         installed_skills: BTreeMap::new(),
     };
