@@ -195,3 +195,80 @@ jobs:
             src-tauri/target/**/release/bundle/appimage/*.AppImage
           retention-days: 30
           if-no-files-found: warn
+
+  # ═══════════════════ 发布 OTA 热更新 + 下载中心(仅 tag v*)═══════════════════
+  # 本机 SSH 被本地 VPN 阻断(banner 超时),改由 runner(可达服务器)发布。
+  # 仅在三平台 build 全绿后跑;分发产物 + 改 binary.json(OTA 清单)+ release.json(下载页)。
+  # 逻辑对齐已验证的 scripts/publish-from-release.sh(8.1.0–8.1.5),改前自动 .bak 备份。
+  publish-ota:
+    name: Publish OTA + Download Center
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci_publish_ota.py
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          VER="${{ github.ref_name }}"; VER="${VER#v}"
+          [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version $VER"; exit 1; }
+          echo "VERSION=$VER" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: _artifacts
+
+      - name: Stage release files
+        shell: bash
+        run: |
+          mkdir -p _stage
+          find _artifacts -type f \( -name '*.exe' -o -name '*.exe.sig' \
+            -o -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \) \
+            -exec cp -f {} _stage/ \;
+          echo "=== staged ==="; ls -la _stage/
+          ls _stage/*x64-setup.exe >/dev/null 2>&1 || { echo "✗ 缺 Windows .exe · 中止发布"; exit 1; }
+          ls _stage/*aarch64.app.tar.gz >/dev/null 2>&1 || { echo "✗ 缺 mac arm OTA payload · 中止发布"; exit 1; }
+
+      - name: Setup SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SERVER_SSH_KEY" > ~/.ssh/ci_deploy
+          chmod 600 ~/.ssh/ci_deploy
+          ssh-keyscan -t ed25519,rsa 47.86.60.178 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy OTA + release.json
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.VERSION }}"
+          NOTES="${VER} · 双端内置 OCR(Win/mac 自带 tesseract+tessdata · 免装依赖开箱即用)· 新引擎送达幂等/多网关横扩契约对齐"
+          NOTES_B64="$(printf '%s' "$NOTES" | base64 | tr -d '\n')"
+          H=root@47.86.60.178; K=~/.ssh/ci_deploy
+          tar -czf _stage.tar.gz -C _stage .
+          scp -i "$K" _stage.tar.gz scripts/ci_publish_ota.py "$H:/tmp/"
+          ssh -i "$K" "$H" "set -e; \
+            rm -rf /tmp/qs_stage_${VER} && mkdir -p /tmp/qs_stage_${VER} && \
+            tar -xzf /tmp/_stage.tar.gz -C /tmp/qs_stage_${VER} && \
+            VERSION='${VER}' NOTES_B64='${NOTES_B64}' SRC_DIR=/tmp/qs_stage_${VER} \
+              python3 /tmp/ci_publish_ota.py && \
+            rm -rf /tmp/qs_stage_${VER} /tmp/_stage.tar.gz /tmp/ci_publish_ota.py"
+
+      - name: Verify OTA endpoints + download page
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.VERSION }}"
+          for a in "darwin/aarch64" "darwin/x86_64" "windows/x86_64"; do
+            got=$(curl -sf "https://www.wujisuanli.com/api/v8/client/updater/${a}/8.0.0" \
+              | python3 -c "import json,sys;print(json.load(sys.stdin).get('version','?'))" 2>/dev/null || echo "?")
+            printf "  %-18s OTA version=%s\n" "$a" "$got"
+            [ "$got" = "$VER" ] || echo "    ⚠ 未返回 $VER(可能后端缓存,稍后自检)"
+          done
+          rv=$(curl -sf "https://pidbai.com/downloads/latest/release.json" \
+            | python3 -c "import json,sys;print(json.load(sys.stdin).get('version','?'))" 2>/dev/null || echo "?")
+          echo "  download page release.json version=$rv"
