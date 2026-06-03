@@ -242,6 +242,22 @@ pub fn invalidate_probe_cache() {
     }
 }
 
+/// 8.1.9 · 非阻塞读缓存 (绝不触发同步探针) · 给 WS 主循环用。
+/// 缓存未就绪返回 None,调用方应回退到 manifest 兜底,**不能**在主循环里同步跑 probe
+/// (probe 要起 python import 重型包 · 最长 90s · 会阻塞 WS 事件循环 → 节点收不到任务/不回结果)。
+pub fn probed_software_cached() -> Option<Vec<String>> {
+    PROBED_SW.read().ok().and_then(|g| g.clone())
+}
+
+/// 8.1.9 · 后台预热探针缓存 (在专用阻塞线程跑,不占 tokio 异步线程)。
+/// 节点启动/连接后调用一次 · 几十秒后缓存就绪 · 之后心跳就能上报真实能力。
+pub fn spawn_probe_warmup() {
+    std::thread::spawn(|| {
+        let sw = probed_software(true);
+        tracing::info!("probe · 后台预热完成 · 真实可用 software {} 个", sw.len());
+    });
+}
+
 /// 写 installed.json · 原子写 (先写临时文件 + rename)
 pub fn write_installed_meta(meta: &InstalledMeta) -> Result<()> {
     let path = paths::installed_meta_path();

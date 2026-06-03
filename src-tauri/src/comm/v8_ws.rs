@@ -112,6 +112,9 @@ async fn run_v8_session(state: &Arc<AppState>, app: &AppHandle, token: &str) -> 
 
     // ── 1. send hello ──
     let worker_id = node_store::load_node_id();
+    // 8.1.9 · 后台预热能力探针 (专用线程,不阻塞 WS 异步循环) ·
+    // 几十秒后缓存就绪 → 后续心跳上报真实可用 software
+    crate::runtime::detector::spawn_probe_warmup();
     let host_caps = collect_capabilities();
     // 2026-05-23 · 从磁盘读 5 能力授权矩阵 (webview 之前通过 save_capability_consent 写入)
     let consent_payload = crate::auth::consent_store::load_as_ws_payload();
@@ -235,9 +238,19 @@ async fn run_v8_session(state: &Arc<AppState>, app: &AppHandle, token: &str) -> 
                     for (tname, t) in installed.tiers.iter() {
                         if t.ok { tier_names.push(tname.clone()); }
                     }
-                    // 8.1.8 · hb 也报真探针验证过的 software (用缓存 · 不每次重跑) ·
-                    // 否则 hello 报真的、hb 又用 manifest 假的覆盖回去
-                    let probed = crate::runtime::detector::probed_software(false);
+                    // 8.1.9 · hb 上报 software · 非阻塞读探针缓存 ·
+                    // 缓存就绪 → 报真实可用;未就绪 → 回退 manifest tier.software (兜底,不阻塞主循环)
+                    // 绝不在此同步跑 probe (会起 python import 阻塞 WS 循环 → 节点变黑洞,8.1.8 教训)
+                    let probed = match crate::runtime::detector::probed_software_cached() {
+                        Some(v) => v,
+                        None => {
+                            let mut s: Vec<String> = Vec::new();
+                            for (_n, t) in installed.tiers.iter() {
+                                if t.ok { for sw in &t.software { if !s.contains(sw) { s.push(sw.clone()); } } }
+                            }
+                            s
+                        }
+                    };
                     if !probed.is_empty() {
                         extra.insert("software".into(), json!(probed));
                     }
@@ -845,8 +858,14 @@ fn collect_capabilities() -> HashMap<String, Value> {
             tier_names.push(tier_name.clone());
         }
     }
-    for s in crate::runtime::detector::probed_software(false) {
-        sw_set.insert(s);
+    // 8.1.9 · hello 非阻塞:探针缓存就绪用真实可用;未就绪回退 manifest (不在此同步跑 probe)
+    match crate::runtime::detector::probed_software_cached() {
+        Some(v) => { for s in v { sw_set.insert(s); } }
+        None => {
+            for (_n, t) in installed.tiers.iter() {
+                if t.ok { for sw in &t.software { sw_set.insert(sw.clone()); } }
+            }
+        }
     }
     let sw_list: Vec<String> = sw_set.into_iter().collect();
     caps.insert("software".into(), json!(sw_list));

@@ -397,6 +397,9 @@ async fn run_v2_skill(
     let build_cmd = |python_bin: &str, bundled_pythonpath: &[std::path::PathBuf]| -> Command {
         let mut command = Command::new(python_bin);
         crate::proc_util::hide_window_tokio(&mut command);
+        // 8.1.9 · 强制子进程 UTF-8 IO (修 Windows python 默认 GBK → 输出 emoji/中文 exit 1)
+        command.env("PYTHONIOENCODING", "utf-8");
+        command.env("PYTHONUTF8", "1");
         resource_limit::apply(&mut command, current_throttle_level());
         command.arg(&entry_file);
         command.current_dir(&skill_dir);
@@ -751,6 +754,11 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<RunOutcome> 
     let build_cmd = |runtime_bin: &str, bundled_pythonpath: &[std::path::PathBuf]| -> Command {
         let mut command = Command::new(runtime_bin);
     crate::proc_util::hide_window_tokio(&mut command);
+    // 8.1.9 · 强制子进程 UTF-8 IO —— 修 Windows python stdout 默认 GBK/cp936,
+    // 脚本输出 emoji/中文(几乎所有脚本的 summary_text)时 UnicodeEncodeError → exit 1。
+    // 这是 "Mac 全成功 · Win 全失败 · 跨版本" 的真正根因。Mac/Linux 默认 UTF-8 不受影响。
+    command.env("PYTHONIOENCODING", "utf-8");
+    command.env("PYTHONUTF8", "1");
     // P0 NCE · 资源限制 (同 run_shell)
     resource_limit::apply(&mut command, current_throttle_level());
     command.arg(&script_path);
