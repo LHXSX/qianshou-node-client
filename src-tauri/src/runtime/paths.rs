@@ -249,43 +249,194 @@ fn dirs_home() -> Option<PathBuf> {
 ///   5. 最终兜底: 系统 python3
 ///
 /// 双端: venv_python(tier) 已 cfg(windows) 区分 bin/python vs Scripts/python.exe
+///
+/// 2026-06-03 · 改为取 python_candidates 的第一个 · 行为兼容老调用方
 pub fn pick_python_with_hint(
     required_tier: Option<&str>,
     fallback_tiers: &[String],
 ) -> (String, Vec<PathBuf>) {
-    // 收集要试的 tier 列表
-    let mut try_tiers: Vec<String> = Vec::new();
+    python_candidates(required_tier, fallback_tiers)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| ("python3".to_string(), Vec::new()))
+}
+
+/// uv 托管的 cpython 真二进制 (UV_PYTHON_INSTALL_DIR = uv_python_dir)
+/// 结构: <uv_python_dir>/cpython-3.x.y-<triple>/python.exe (Win) | bin/python3.x (Unix)
+pub fn uv_managed_python() -> Option<PathBuf> {
+    let root = uv_python_dir();
+    if !root.is_dir() {
+        return None;
+    }
+    let entries = std::fs::read_dir(&root).ok()?;
+    for entry in entries.flatten() {
+        if !entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("cpython-") {
+            continue;
+        }
+        if cfg!(target_os = "windows") {
+            let p = entry.path().join("python.exe");
+            if p.exists() {
+                return Some(p);
+            }
+        } else {
+            // bin/python3.x 或 bin/python
+            let bin = entry.path().join("bin");
+            if let Ok(rd) = std::fs::read_dir(&bin) {
+                for f in rd.flatten() {
+                    let fname = f.file_name().to_string_lossy().into_owned();
+                    if fname.starts_with("python3") || fname == "python" {
+                        return Some(f.path());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 系统 python 兜底候选 (绝对路径优先 · 最后才用裸命令)
+/// Windows: py 启动器 + LOCALAPPDATA / Program Files 常见安装位 · 绝不只靠 PATH 里的 python3
+fn system_python_candidates() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        // 1. 常见安装目录里的 python.exe (绝对路径 · 最稳)
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            roots.push(PathBuf::from(local).join("Programs").join("Python"));
+        }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            roots.push(PathBuf::from(pf));
+        }
+        roots.push(PathBuf::from(r"C:\Python311"));
+        roots.push(PathBuf::from(r"C:\Python312"));
+        roots.push(PathBuf::from(r"C:\Python310"));
+        for root in roots {
+            if let Ok(rd) = std::fs::read_dir(&root) {
+                for e in rd.flatten() {
+                    let n = e.file_name().to_string_lossy().to_lowercase();
+                    if n.starts_with("python") {
+                        let p = e.path().join("python.exe");
+                        if p.exists() {
+                            out.push(p.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+            // root 本身就是 pythonXX 目录的情况
+            let direct = root.join("python.exe");
+            if direct.exists() {
+                out.push(direct.to_string_lossy().into_owned());
+            }
+        }
+        // 2. py 启动器 (微软推荐 · 能自动找已装 python) · 作为命令兜底
+        out.push("py".to_string());
+        // 3. 最后才裸 python (PATH 里有就用) · python3 在 Win 常是 Store 占位,放最后
+        out.push("python".to_string());
+        out.push("python3".to_string());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        for p in [
+            "/usr/bin/python3",
+            "/usr/local/bin/python3",
+            "/opt/homebrew/bin/python3",
+        ] {
+            if std::path::Path::new(p).exists() {
+                out.push(p.to_string());
+            }
+        }
+        out.push("python3".to_string());
+        out.push("python".to_string());
+    }
+    out
+}
+
+/// V8.1+ · 返回有序的 python 候选列表 (绝对路径优先 · 末尾系统兜底)
+///
+/// executor 逐个 try-spawn · 直到某个真能起来:
+///   - 覆盖 required/fallback/lite venv 都没装、但别的 tier venv 装了的情况
+///   - 覆盖 venv python 存在却起不来 (重定位失败 / 缺 DLL) → 自动退到下一个
+///   - Windows 绝不静默退到裸 "python3" (那是 103 灾难的根因)
+///
+/// 路由优先级 (高 → 低):
+///   1. required_tier venv
+///   2. fallback_tiers venv (按序)
+///   3. lite venv (auto_install)
+///   4. 其它任意已存在的 venv (扫 venvs/)
+///   5. uv 托管 cpython / 内置烘焙 cpython (无 venv 也能跑基础脚本)
+///   6. 老内置 runtime (cpython + envs site-packages · 带 PYTHONPATH)
+///   7. 系统 python (Windows: 绝对路径 → py 启动器 → 裸命令)
+pub fn python_candidates(
+    required_tier: Option<&str>,
+    fallback_tiers: &[String],
+) -> Vec<(String, Vec<PathBuf>)> {
+    let mut tiers: Vec<String> = Vec::new();
     if let Some(rt) = required_tier {
         if !rt.is_empty() {
-            try_tiers.push(rt.to_string());
+            tiers.push(rt.to_string());
         }
     }
     for fb in fallback_tiers {
-        if !fb.is_empty() && !try_tiers.contains(fb) {
-            try_tiers.push(fb.clone());
+        if !fb.is_empty() && !tiers.contains(fb) {
+            tiers.push(fb.clone());
         }
     }
-    // 兜底 lite (auto_install)
-    let lite = "lite".to_string();
-    if !try_tiers.contains(&lite) {
-        try_tiers.push(lite);
+    if !tiers.iter().any(|t| t == "lite") {
+        tiers.push("lite".to_string());
     }
 
-    // 按顺序试 venvs/<tier>/bin/python (Win: Scripts/python.exe)
-    for tier in &try_tiers {
-        let py = venv_python(tier);
-        if py.exists() {
-            return (py.to_string_lossy().into_owned(), Vec::new());
+    // 绝对路径候选 (venv python + cpython) · 去重
+    let mut abs: Vec<PathBuf> = Vec::new();
+    let mut push_abs = |p: PathBuf, abs: &mut Vec<PathBuf>| {
+        if p.exists() && !abs.contains(&p) {
+            abs.push(p);
+        }
+    };
+    for t in &tiers {
+        push_abs(venv_python(t), &mut abs);
+    }
+    // 扫所有已存在 venv
+    if let Ok(rd) = std::fs::read_dir(venvs_root()) {
+        for e in rd.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = e.file_name().to_string_lossy().into_owned();
+                push_abs(venv_python(&name), &mut abs);
+            }
         }
     }
+    // uv 托管 / 内置 cpython (无 venv 兜底)
+    if let Some(p) = uv_managed_python() {
+        push_abs(p, &mut abs);
+    }
+    if let Some(p) = bundled_python_bin() {
+        push_abs(p, &mut abs);
+    }
 
-    // 老路径兜底 (8.0.x 升 8.1.0 · cpython + envs 还在)
+    let mut out: Vec<(String, Vec<PathBuf>)> = abs
+        .into_iter()
+        .map(|p| (p.to_string_lossy().into_owned(), Vec::new()))
+        .collect();
+
+    // 老内置 runtime (cpython + envs site-packages) · 带 pythonpath
     if let Some((p, pp)) = bundled_runtime_for(&["image", "base"]) {
-        return (p.to_string_lossy().into_owned(), pp);
+        let s = p.to_string_lossy().into_owned();
+        if !out.iter().any(|(x, _)| x == &s) {
+            out.push((s, pp));
+        }
     }
 
-    // 最终兜底: 系统 python3
-    ("python3".to_string(), Vec::new())
+    // 系统兜底
+    for sysp in system_python_candidates() {
+        if !out.iter().any(|(x, _)| x == &sysp) {
+            out.push((sysp, Vec::new()));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

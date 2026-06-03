@@ -116,39 +116,66 @@ async fn spawn_python_tool(
 
     // V8.1 (2026-05-27) · 跟 executor.rs 共用路由 · 优先用 venvs/<tier>/bin/python
     // skill_exec 不带 required_tier (skill 元数据未来可扩展) · 走默认 lite 兜底
-    let (python_bin, bundled_pp) = crate::runtime::paths::pick_python_with_hint(None, &[]);
-    tracing::info!(
-        "tool_caller · skill={} tool={} python={}",
-        skill.id, tool.name, python_bin
-    );
-    let mut command = Command::new(&python_bin);
-    crate::proc_util::hide_window_tokio(&mut command);
-    command
-        .arg(entry_file)
-        .current_dir(&skill.dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    // 2026-06-03 · 改候选列表逐个 try-spawn (Win venv 起不来/缺则自动退下一个 · 修 103)
+    let candidates = crate::runtime::paths::python_candidates(None, &[]);
+    let build_cmd = |python_bin: &str, bundled_pp: &[std::path::PathBuf]| -> Command {
+        let mut command = Command::new(python_bin);
+        crate::proc_util::hide_window_tokio(&mut command);
+        command
+            .arg(entry_file)
+            .current_dir(&skill.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // 老路径 fallback 时塞 PYTHONPATH (cpython + envs/{image,base})
+        if !bundled_pp.is_empty() {
+            let sep = if cfg!(windows) { ";" } else { ":" };
+            let mut parts: Vec<String> = bundled_pp
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            if let Ok(existing) = std::env::var("PYTHONPATH") {
+                if !existing.is_empty() {
+                    parts.push(existing);
+                }
+            }
+            command.env("PYTHONPATH", parts.join(sep));
+        }
+        command
+    };
 
-    // 老路径 fallback 时塞 PYTHONPATH (cpython + envs/{image,base})
-    if !bundled_pp.is_empty() {
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        let mut parts: Vec<String> = bundled_pp
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        if let Ok(existing) = std::env::var("PYTHONPATH") {
-            if !existing.is_empty() {
-                parts.push(existing);
+    let mut child_opt = None;
+    let mut last_err = String::new();
+    let total = candidates.len();
+    for (i, (python_bin, bundled_pp)) in candidates.iter().enumerate() {
+        match build_cmd(python_bin, bundled_pp).spawn() {
+            Ok(c) => {
+                tracing::info!(
+                    "tool_caller · skill={} tool={} python={} (候选 #{})",
+                    skill.id, tool.name, python_bin, i
+                );
+                child_opt = Some(c);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("{} ({})", python_bin, e);
+                tracing::warn!(
+                    "tool_caller · python 候选启动失败 [{}/{}]: {}",
+                    i + 1, total, last_err
+                );
             }
         }
-        command.env("PYTHONPATH", parts.join(sep));
     }
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("启动 python ({}) 失败 (skill={} tool={})", python_bin, skill.id, tool.name))?;
+    let mut child = match child_opt {
+        Some(c) => c,
+        None => {
+            return Err(anyhow!(
+                "启动 python 失败 (skill={} tool={}): {} 个候选全部失败 (最后: {})",
+                skill.id, tool.name, total, last_err
+            ))
+        }
+    };
 
     // 喂 stdin
     if let Some(mut stdin) = child.stdin.take() {

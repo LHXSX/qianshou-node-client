@@ -261,7 +261,7 @@ jobs:
         shell: bash
         run: |
           VER="${{ steps.ver.outputs.VERSION }}"
-          NOTES="${VER} · 双端内置 OCR(Win/mac 自带 tesseract+tessdata · 免装依赖开箱即用)· 新引擎送达幂等/多网关横扩契约对齐"
+          NOTES="${VER} · 紧急修复 Windows 节点 exit 103(子进程 Python 解释器解析失败 · 致全部脚本跑不了)· python 解析改候选列表逐个 try-spawn(扫全部 venv + uv/内置 cpython + Win 绝对路径/py 启动器),绝不静默退裸 python3 · venv 坏/缺自动退到下一个可用解释器"
           NOTES_B64="$(printf '%s' "$NOTES" | base64 | tr -d '\n')"
           H=root@47.86.60.178; K=~/.ssh/ci_deploy
           tar -czf _stage.tar.gz -C _stage .

@@ -296,8 +296,13 @@ async fn run_v2_skill(
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
-    // 1. 选 python (tier 路由) · 复用 pick_python_for_task
-    let (python_bin, bundled_pythonpath) = pick_python_for_task(task, "python3");
+    // 1. 选 python 候选 (tier 路由 · 逐个 try-spawn)
+    let rt_hint = if task.required_tier.is_empty() {
+        None
+    } else {
+        Some(task.required_tier.as_str())
+    };
+    let candidates = crate::runtime::paths::python_candidates(rt_hint, &task.fallback_tiers);
 
     // 2. 构造 stdin JSON · 透传 task.args + 补上上下文
     let mut stdin_data = if task.args.is_object() {
@@ -314,42 +319,75 @@ async fn run_v2_skill(
     let stdin_bytes = serde_json::to_vec(&stdin_data).context("序列化 v2 stdin 失败")?;
 
     // 3. spawn python <entry_file> · cwd = skill_dir (sys.path 默认含当前目录 → _runtime 可 import)
-    let mut command = Command::new(&python_bin);
-    crate::proc_util::hide_window_tokio(&mut command);
-    resource_limit::apply(&mut command, current_throttle_level());
-    command.arg(&entry_file);
-    command.current_dir(&skill_dir);
-    command.kill_on_drop(true);
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let build_cmd = |python_bin: &str, bundled_pythonpath: &[std::path::PathBuf]| -> Command {
+        let mut command = Command::new(python_bin);
+        crate::proc_util::hide_window_tokio(&mut command);
+        resource_limit::apply(&mut command, current_throttle_level());
+        command.arg(&entry_file);
+        command.current_dir(&skill_dir);
+        command.kill_on_drop(true);
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    // 4. PYTHONPATH = bundled_pythonpath + skill_dir (多一层保险 _runtime 能 import)
-    let sep = if cfg!(windows) { ";" } else { ":" };
-    let mut path_parts: Vec<String> = bundled_pythonpath
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    path_parts.push(skill_dir.to_string_lossy().into_owned());
-    if let Ok(existing) = std::env::var("PYTHONPATH") {
-        if !existing.is_empty() {
-            path_parts.push(existing);
+        // 4. PYTHONPATH = bundled_pythonpath + skill_dir (多一层保险 _runtime 能 import)
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let mut path_parts: Vec<String> = bundled_pythonpath
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        path_parts.push(skill_dir.to_string_lossy().into_owned());
+        if let Ok(existing) = std::env::var("PYTHONPATH") {
+            if !existing.is_empty() {
+                path_parts.push(existing);
+            }
+        }
+        command.env("PYTHONPATH", path_parts.join(sep));
+
+        // 5. 上下文 env vars (v2 context.py 支持 stdin / env 双通道)
+        command.env("EC_TASK_ID", &task.task_id);
+        command.env("EC_TOOL_NAME", &tool_name);
+        if let Some(params) = stdin_data.get("params") {
+            command.env("EC_PARAMS", serde_json::to_string(params).unwrap_or_default());
+        }
+        if let Some(ik) = stdin_data.get("input_kind").and_then(|v| v.as_str()) {
+            command.env("EC_INPUT_KIND", ik);
+        }
+        command
+    };
+
+    // 6. 逐个候选 try-spawn (Win venv 起不来自动退下一个) + 喉 stdin
+    let mut child_opt = None;
+    let mut last_err = String::new();
+    let total = candidates.len();
+    for (i, (python_bin, bundled_pythonpath)) in candidates.iter().enumerate() {
+        match build_cmd(python_bin, bundled_pythonpath).spawn() {
+            Ok(c) => {
+                if i > 0 {
+                    tracing::warn!(
+                        "v2 skill · python 候选 #{} 启动成功 (前 {} 个失败) → {}",
+                        i, i, python_bin
+                    );
+                }
+                child_opt = Some(c);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("{} ({})", python_bin, e);
+                tracing::warn!(
+                    "v2 skill · python 候选启动失败 [{}/{}]: {}",
+                    i + 1, total, last_err
+                );
+            }
         }
     }
-    command.env("PYTHONPATH", path_parts.join(sep));
-
-    // 5. 上下文 env vars (v2 context.py 支持 stdin / env 双通道)
-    command.env("EC_TASK_ID", &task.task_id);
-    command.env("EC_TOOL_NAME", &tool_name);
-    if let Some(params) = stdin_data.get("params") {
-        command.env("EC_PARAMS", serde_json::to_string(params).unwrap_or_default());
-    }
-    if let Some(ik) = stdin_data.get("input_kind").and_then(|v| v.as_str()) {
-        command.env("EC_INPUT_KIND", ik);
-    }
-
-    // 6. 启动 + 喉 stdin
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("v2 skill spawn 失败: {}", python_bin))?;
+    let mut child = match child_opt {
+        Some(c) => c,
+        None => {
+            return Err(anyhow!(
+                "v2 skill 无可用 Python:{} 个候选全部启动失败 (最后: {})",
+                total, last_err
+            ))
+        }
+    };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(&stdin_bytes).await;
         drop(stdin);
@@ -372,22 +410,6 @@ async fn run_v2_skill(
             Ok((stdout, exit_code))
         }
     }
-}
-
-/// V8.1 (2026-05-27) · 按 task.required_tier 选 venv 跑 Python 脚本
-/// 委托给 paths::pick_python_with_hint · 跟 tool_caller.rs 共用同一套路由
-fn pick_python_for_task(task: &TaskAssign, _runtime: &str) -> (String, Vec<std::path::PathBuf>) {
-    let rt_hint = if task.required_tier.is_empty() {
-        None
-    } else {
-        Some(task.required_tier.as_str())
-    };
-    let (py, pp) = crate::runtime::paths::pick_python_with_hint(rt_hint, &task.fallback_tiers);
-    tracing::info!(
-        "executor · python 路由 → {} (required_tier={:?} fb={:?})",
-        py, task.required_tier, task.fallback_tiers
-    );
-    (py, pp)
 }
 
 /// M3.6 script 模式：拉 code_url → 写到临时文件 → 用 runtime 执行
@@ -634,13 +656,22 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<(String, i32
     //
     // 老后端 (v8.0.x) 不发 required_tier · serde 取空 · 直接进 step 3 (venvs/lite)
     // 新客户端首次启动会自动装 lite · 所以 step 3 几乎一定命中
-    let (runtime_bin, bundled_pythonpath): (String, Vec<std::path::PathBuf>) =
+    // 4a. python 候选 (tier 路由 · 逐个 try-spawn · Win venv 起不来自动退下一个)
+    let rt_hint = if task.required_tier.is_empty() {
+        None
+    } else {
+        Some(task.required_tier.as_str())
+    };
+    let candidates: Vec<(String, Vec<std::path::PathBuf>)> =
         if runtime == "python3" || runtime == "python" {
-            pick_python_for_task(task, &runtime)
+            crate::runtime::paths::python_candidates(rt_hint, &task.fallback_tiers)
         } else {
-            (runtime.clone(), Vec::new())
+            vec![(runtime.clone(), Vec::new())]
         };
-    let mut command = Command::new(&runtime_bin);
+    use std::process::Stdio;
+    // 同一套配置 · 对每个候选 python 重建 Command (env/PATH/PYTHONPATH 一致)
+    let build_cmd = |runtime_bin: &str, bundled_pythonpath: &[std::path::PathBuf]| -> Command {
+        let mut command = Command::new(runtime_bin);
     crate::proc_util::hide_window_tokio(&mut command);
     // P0 NCE · 资源限制 (同 run_shell)
     resource_limit::apply(&mut command, current_throttle_level());
@@ -729,15 +760,49 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<(String, i32
         let joined = parts.join(sep);
         command.env("PYTHONPATH", joined);
     }
-    command.kill_on_drop(true);
+        command.kill_on_drop(true);
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+    };
 
-    // 5. 接 stdin（必须先 stdin(piped)）
-    use std::process::Stdio;
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("启动 runtime 失败: {}", runtime))?;
+    // 4d. 逐个候选 try-spawn · 第一个能起来的就用 (Win: venv 坏/缺则自动退到下一个)
+    let mut child_opt = None;
+    let mut used_py = String::new();
+    let mut last_err = String::new();
+    let total = candidates.len();
+    for (i, (runtime_bin, bundled_pythonpath)) in candidates.iter().enumerate() {
+        match build_cmd(runtime_bin, bundled_pythonpath).spawn() {
+            Ok(c) => {
+                if i > 0 {
+                    tracing::warn!(
+                        "executor · python 候选 #{} 启动成功 (前 {} 个失败) → {}",
+                        i, i, runtime_bin
+                    );
+                }
+                used_py = runtime_bin.clone();
+                child_opt = Some(c);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("{} ({})", runtime_bin, e);
+                tracing::warn!(
+                    "executor · python 候选启动失败 [{}/{}]: {}",
+                    i + 1, total, last_err
+                );
+            }
+        }
+    }
+    let mut child = match child_opt {
+        Some(c) => c,
+        None => {
+            return Err(anyhow!(
+                "节点无可用 Python:{} 个候选全部启动失败 (最后: {})。\
+                 请确认 lite runtime 已安装 (~/.qianshou/runtime/venvs/lite)",
+                total, last_err
+            ))
+        }
+    };
+    tracing::info!("executor · run_script 用 python={} task_type={}", used_py, task.task_type);
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         // 二进制优先 (single_file 下载的 PNG/JPG/WAV 等)
