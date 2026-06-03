@@ -73,6 +73,175 @@ pub fn read_installed_meta() -> InstalledMeta {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// 8.1.8 · 能力探针 (probe) · 治"假装"
+//
+// 问题: 此前只要 installed.json 里 tier.ok==true,就把 manifest 声称的
+//       software 全部上报。8GB 弱机装了 vision-ai tier 就吹自己有 torch,
+//       结果接到 LLM 任务直接 OOM。
+//
+// 方案: 用每个 tier **自己 venv 的 python** 真 import 验证声称的包,
+//       只上报真能 import 的;系统工具 (ffmpeg/blender) 用 which 验。
+//       结果缓存,自愈装新包后调 invalidate_probe_cache() 刷新。
+// ════════════════════════════════════════════════════════════════════
+
+use std::collections::BTreeSet;
+use std::sync::RwLock;
+
+static PROBED_SW: RwLock<Option<Vec<String>>> = RwLock::new(None);
+
+/// 系统命令行工具 (用 which 验,不是 python 包)
+fn is_system_tool(sw: &str) -> bool {
+    matches!(
+        sw,
+        "ffmpeg" | "ffprobe" | "blender" | "ollama" | "imagemagick"
+            | "convert" | "unzip" | "git" | "tesseract"
+    )
+}
+
+/// pip 包名 → import 名 (probe 时用 import 名 · 常见不一致的映射)
+fn pip_to_import(pip: &str) -> &str {
+    match pip {
+        "pillow" => "PIL",
+        "pymupdf" => "fitz",
+        "opencv-python" | "opencv-python-headless" => "cv2",
+        "scikit-learn" => "sklearn",
+        "beautifulsoup4" => "bs4",
+        "pyyaml" => "yaml",
+        "scikit-image" => "skimage",
+        "faster-whisper" => "faster_whisper",
+        "python-dateutil" => "dateutil",
+        other => other,
+    }
+}
+
+/// 用指定 venv python 一次性 import 一批模块 · 返回真能 import 的 import 名集合。
+/// 单进程跑完所有 import (省解释器启动开销),带整批超时防卡死。
+fn probe_imports_batch(venv_py: &str, import_names: &[&str]) -> BTreeSet<String> {
+    use std::process::{Command as StdCommand, Stdio};
+    let mut out = BTreeSet::new();
+    if import_names.is_empty() {
+        return out;
+    }
+    // python: 逐个 try import · 成功的打印一行
+    let script = r#"
+import sys
+for m in sys.argv[1:]:
+    try:
+        __import__(m)
+        print(m, flush=True)
+    except Exception:
+        pass
+"#;
+    let mut cmd = StdCommand::new(venv_py);
+    cmd.arg("-c").arg(script);
+    for m in import_names {
+        cmd.arg(m);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    crate::proc_util::hide_window_std(&mut cmd);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return out, // venv python 起不来 → 全不算有
+    };
+    // 整批超时 90s (torch/transformers import 慢 · 但不能无限卡)
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    return out; // 卡死 = 这批都不算可用 (宁缺毋滥)
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(_) => return out,
+        }
+    }
+    if let Ok(output) = child.wait_with_output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let m = line.trim();
+            if !m.is_empty() {
+                out.insert(m.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 对单个 tier 做真实探针 · 返回**验证通过**的 software 子集
+pub fn probe_tier_software(tier: &InstalledTier) -> Vec<String> {
+    let mut verified: Vec<String> = Vec::new();
+    let mut py_pkgs: Vec<(String, String)> = Vec::new(); // (import_name, sw_name)
+
+    for sw in &tier.software {
+        if is_system_tool(sw) {
+            if which::which(sw).is_ok() {
+                verified.push(sw.clone());
+            }
+        } else {
+            py_pkgs.push((pip_to_import(sw).to_string(), sw.clone()));
+        }
+    }
+
+    let py_ok = !tier.python.is_empty() && std::path::Path::new(&tier.python).exists();
+    if !py_pkgs.is_empty() && py_ok {
+        let imports: Vec<&str> = py_pkgs.iter().map(|(i, _)| i.as_str()).collect();
+        let ok_set = probe_imports_batch(&tier.python, &imports);
+        for (imp, sw) in &py_pkgs {
+            if ok_set.contains(imp) {
+                verified.push(sw.clone());
+            }
+        }
+    }
+    verified
+}
+
+/// 读 installed.json → 对每个 ok tier 跑探针 → 真实可用 software 列表 (带缓存)。
+/// force=true 强制重新探针 (自愈装新包后用)。
+pub fn probed_software(force: bool) -> Vec<String> {
+    if !force {
+        if let Ok(guard) = PROBED_SW.read() {
+            if let Some(v) = guard.as_ref() {
+                return v.clone();
+            }
+        }
+    }
+    let installed = read_installed_meta();
+    let mut all: BTreeSet<String> = BTreeSet::new();
+    for (tier_name, tier) in installed.tiers.iter() {
+        if !tier.ok {
+            continue;
+        }
+        let verified = probe_tier_software(tier);
+        let claimed = tier.software.len();
+        if verified.len() < claimed {
+            tracing::warn!(
+                "probe · tier={} 声称 {} 个 software · 实测可用 {} 个 (剔除 {} 个假装)",
+                tier_name, claimed, verified.len(), claimed - verified.len()
+            );
+        }
+        for s in verified {
+            all.insert(s);
+        }
+    }
+    let result: Vec<String> = all.into_iter().collect();
+    if let Ok(mut guard) = PROBED_SW.write() {
+        *guard = Some(result.clone());
+    }
+    result
+}
+
+/// 自愈装了新包后调用 · 下次 probed_software 会重新探针
+pub fn invalidate_probe_cache() {
+    if let Ok(mut guard) = PROBED_SW.write() {
+        *guard = None;
+    }
+}
+
 /// 写 installed.json · 原子写 (先写临时文件 + rename)
 pub fn write_installed_meta(meta: &InstalledMeta) -> Result<()> {
     let path = paths::installed_meta_path();

@@ -261,7 +261,7 @@ jobs:
         shell: bash
         run: |
           VER="${{ steps.ver.outputs.VERSION }}"
-          NOTES="${VER} · 紧急修复 Windows 节点 exit 103(子进程 Python 解释器解析失败 · 致全部脚本跑不了)· python 解析改候选列表逐个 try-spawn(扫全部 venv + uv/内置 cpython + Win 绝对路径/py 启动器),绝不静默退裸 python3 · venv 坏/缺自动退到下一个可用解释器"
+          NOTES="${VER} · 节点企业级可观测+自愈:① 失败诊断三件套(stderr_tail/exit_code/python_used 回传后端·Win 出错不再只看到光秃秃的 exit 码)② 失败分类(env/script/resource/network/timeout·缺包名提取)③ 能力真探针(用各 tier venv 真 import 验证·杜绝低配机吹自己有 torch 被错派)④ 节点自愈(环境类失败→后台重装对应 tier→刷新能力→下次心跳重报真实能力·带每日限流+连续失败放弃防失控)"
           NOTES_B64="$(printf '%s' "$NOTES" | base64 | tr -d '\n')"
           H=root@47.86.60.178; K=~/.ssh/ci_deploy
           tar -czf _stage.tar.gz -C _stage .

@@ -231,17 +231,15 @@ async fn run_v8_session(state: &Arc<AppState>, app: &AppHandle, token: &str) -> 
                     // 不必每次都读 installed.json · 但开销小 (< 5KB 文件) · 跟其他 hb 操作比可忽略
                     // 旧版后端不消费这些 key (heartbeat.py 白名单外) · 向后兼容
                     let installed = crate::runtime::detector::read_installed_meta();
-                    let mut sw_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
                     let mut tier_names: Vec<String> = Vec::new();
                     for (tname, t) in installed.tiers.iter() {
-                        if !t.ok { continue; }
-                        tier_names.push(tname.clone());
-                        for s in &t.software {
-                            sw_set.insert(s.clone());
-                        }
+                        if t.ok { tier_names.push(tname.clone()); }
                     }
-                    if !sw_set.is_empty() {
-                        extra.insert("software".into(), json!(sw_set.into_iter().collect::<Vec<_>>()));
+                    // 8.1.8 · hb 也报真探针验证过的 software (用缓存 · 不每次重跑) ·
+                    // 否则 hello 报真的、hb 又用 manifest 假的覆盖回去
+                    let probed = crate::runtime::detector::probed_software(false);
+                    if !probed.is_empty() {
+                        extra.insert("software".into(), json!(probed));
                     }
                     if !tier_names.is_empty() {
                         extra.insert("runtime_tiers".into(), json!(tier_names));
@@ -618,6 +616,13 @@ async fn run_shard_task(
         inline_output,
         elapsed_ms: Some(result.elapsed_ms as i64),
         error: result.error.clone().unwrap_or_default(),
+        // 8.1.8 · 失败诊断三件套 (后端 aggregator 拼进 we_shards.error)
+        stderr_tail: result.stderr_tail.clone().unwrap_or_default(),
+        exit_code: result.exit_code,
+        python_used: result.python_used.clone().unwrap_or_default(),
+        // 8.1.8 · 失败分类 + 缺失依赖
+        failure_class: result.failure_class.clone().unwrap_or_default(),
+        missing_dep: result.missing_dep.clone().unwrap_or_default(),
     };
     let out = OutFrame::new("shard_result", payload.clone());
     let frame_json = serde_json::to_string(&out)?;
@@ -642,6 +647,26 @@ async fn run_shard_task(
         done["error"] = serde_json::json!(err);
     }
     let _ = app.emit("task_phase", &done);
+
+    // 8.1.8 · 失败且属环境类 → 后台触发节点自愈 (不阻塞结果上报)
+    // 修好后 self_heal 会刷新探针缓存 → 下次心跳重报真实能力 → 调度器重新认为合格
+    if !result.ok {
+        if let Some(fc_str) = result.failure_class.as_deref() {
+            let fc = crate::task::failure_class::FailureClass::parse(fc_str);
+            if fc.is_self_healable() {
+                let app_h = app.clone();
+                let tier_hint = assign.required_tier.clone();
+                let dep = result.missing_dep.clone();
+                tokio::spawn(async move {
+                    let out = crate::task::self_heal::try_heal(app_h, fc, dep, tier_hint).await;
+                    tracing::info!(
+                        "self_heal · attempted={} success={} kind={} tier={} detail={}",
+                        out.attempted, out.success, out.kind, out.tier, out.detail
+                    );
+                });
+            }
+        }
+    }
 
     Ok(())
 }
@@ -809,20 +834,19 @@ fn collect_capabilities() -> HashMap<String, Value> {
         .map(|s| s.to_string())
         .collect();
 
-    // 2026-05-20 · 叠加 ~/.qianshou/runtime/installed.json 提供的 software
-    // 调度器 planner.py 用 capabilities.software 匹配 task_registry.required_software
-    // 用户在客户端工具页点"一键安装运行环境"装了 lite/ocr/speech/vision-ai 后,
-    // 这里就会上报 ["pillow","numpy","onnxruntime","pymupdf","pdfplumber","ffmpeg",...]
+    // 8.1.8 · 能力探针:不再盲信 manifest 声称的 software,
+    // 改用每个 tier venv 真 import 验证过的子集 (治"假装" · 见 detector::probed_software)
+    // 调度器 planner.py 用 capabilities.software 匹配 task_registry.required_software,
+    // 上报真实可用的,才能避免"8GB 机吹自己有 torch → 接 LLM → OOM"。
     let installed = crate::runtime::detector::read_installed_meta();
     let mut tier_names: Vec<String> = Vec::new();
     for (tier_name, tier) in installed.tiers.iter() {
-        if !tier.ok {
-            continue;
+        if tier.ok {
+            tier_names.push(tier_name.clone());
         }
-        tier_names.push(tier_name.clone());
-        for s in &tier.software {
-            sw_set.insert(s.clone());
-        }
+    }
+    for s in crate::runtime::detector::probed_software(false) {
+        sw_set.insert(s);
     }
     let sw_list: Vec<String> = sw_set.into_iter().collect();
     caps.insert("software".into(), json!(sw_list));

@@ -34,12 +34,40 @@ use super::llm_runtime::{LlmInferRequest, LLMRuntime};
 use super::resource_limit::{self, ThrottleLevel};
 use super::tool_caller::{self, ToolCallOutput};
 use super::{TaskAssign, TaskResult};
+use super::failure_class;
 
 // 2026-05-18 · 8 KB 太小 · 单张图 base64 就超过 → 任务输出 JSON 被截断
 // v8 任务输出常含 result_image_b64 (单图 ~50KB-2MB) · multi_file 任务更大
 // 提到 16 MB · 大于此值的脚本应该上传 OSS 返 URL (不要 inline)
 const OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const ALLOWED_RUNTIMES: &[&str] = &["shell", "bash", "sh", "python3", "python", "node"];
+
+/// 8.1.8 (2026-06-03) · 子进程跑完后的完整诊断信息 (带回 stderr/python_used)
+/// 为了让 Win 节点 exit 1/103 这种"只有数字没原因"的失败可定位
+pub struct RunOutcome {
+    pub output: String,
+    pub exit_code: i32,
+    pub stderr_tail: String,    // 最多 2KB
+    pub python_used: String,    // 实际启动的解释器绝对路径
+}
+
+impl RunOutcome {
+    pub fn plain(output: String, exit_code: i32) -> Self {
+        Self { output, exit_code, stderr_tail: String::new(), python_used: String::new() }
+    }
+}
+
+/// 截 stderr 尾部 · 防 we_shards.error 列爆掉
+fn tail_stderr(raw: &[u8], max_bytes: usize) -> String {
+    if raw.is_empty() { return String::new(); }
+    let s = String::from_utf8_lossy(raw);
+    if s.len() <= max_bytes { return s.to_string(); }
+    // 从尾部回退到 char 边界
+    let start = s.len() - max_bytes;
+    let mut start = start;
+    while start < s.len() && !s.is_char_boundary(start) { start += 1; }
+    s[start..].to_string()
+}
 
 pub async fn run_task(task: &TaskAssign) -> TaskResult {
     run_task_with_progress(task, "").await
@@ -54,44 +82,67 @@ pub async fn run_task_with_progress(task: &TaskAssign, _node_id: &str) -> TaskRe
     }
 
     match try_run(task).await {
-        Ok((output, exit_code)) => {
+        Ok(outcome) => {
             // P0 NCE · shell/script 也算 result_sha256 (反作弊覆盖 100%)
             // 在未截断的完整 output 上算 · 跨副本可比对
-            let sha = super::skill_registry::sha256_hex(output.as_bytes());
-            TaskResult {
-            task_id: task.task_id.clone(),
-            ok: exit_code == 0,
-            elapsed_ms: start.elapsed().as_millis() as u64,
-            output: truncate_output(&output),
-            error: if exit_code == 0 {
+            let sha = super::skill_registry::sha256_hex(outcome.output.as_bytes());
+            let ok = outcome.exit_code == 0;
+            // 8.1.8 · 失败时分类 (供后端区分对待 + 触发自愈)
+            let cls = if ok {
                 None
             } else {
-                Some(format!("exit code {}", exit_code))
+                Some(failure_class::classify(
+                    Some(outcome.exit_code),
+                    &outcome.stderr_tail,
+                    &format!("exit code {}", outcome.exit_code),
+                ))
+            };
+            TaskResult {
+            task_id: task.task_id.clone(),
+            ok,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            output: truncate_output(&outcome.output),
+            error: if ok {
+                None
+            } else {
+                Some(format!("exit code {}", outcome.exit_code))
             },
-            exit_code: Some(exit_code),
+            exit_code: Some(outcome.exit_code),
             skill_id: None,
             tool: None,
             result_sha256: Some(sha),
-            stderr_tail: None,
+            // 失败时回传 stderr_tail · 成功时不带 (省带宽)
+            stderr_tail: if ok || outcome.stderr_tail.is_empty() { None } else { Some(outcome.stderr_tail) },
+            python_used: if outcome.python_used.is_empty() { None } else { Some(outcome.python_used) },
+            failure_class: cls.as_ref().map(|c| c.class.as_str().to_string()),
+            missing_dep: cls.as_ref().and_then(|c| c.missing_dep.clone()),
             }
         },
-        Err(e) => TaskResult {
-            task_id: task.task_id.clone(),
-            ok: false,
-            elapsed_ms: start.elapsed().as_millis() as u64,
-            output: String::new(),
-            error: Some(e.to_string()),
-            exit_code: None,
-            skill_id: None,
-            tool: None,
-            result_sha256: None,
-            stderr_tail: None,
+        Err(e) => {
+            let emsg = e.to_string();
+            // 8.1.8 · spawn 失败/下载失败/超时等 · 也分类
+            let c = failure_class::classify(None, "", &emsg);
+            TaskResult {
+                task_id: task.task_id.clone(),
+                ok: false,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                output: String::new(),
+                error: Some(emsg),
+                exit_code: None,
+                skill_id: None,
+                tool: None,
+                result_sha256: None,
+                stderr_tail: None,
+                python_used: None,
+                failure_class: Some(c.class.as_str().to_string()),
+                missing_dep: c.missing_dep.clone(),
+            }
         },
     }
     // 进度由 v8_ws 在收到结果后统一上报 ShardProgress / ShardResult
 }
 
-async fn try_run(task: &TaskAssign) -> Result<(String, i32)> {
+async fn try_run(task: &TaskAssign) -> Result<RunOutcome> {
     let timeout = Duration::from_secs(task.timeout_s.max(1).min(600));
 
     // 2026-05-18 v8 收口策略:
@@ -161,6 +212,9 @@ async fn run_skill_exec_and_pack(task: &TaskAssign, start: Instant) -> TaskResul
                     tool: tool_name_opt,
                     result_sha256: None,
                     stderr_tail: None,
+                    python_used: None,
+                    failure_class: Some(failure_class::FailureClass::NetworkError.as_str().to_string()),
+                    missing_dep: None,
                 };
             }
         }
@@ -181,6 +235,9 @@ async fn run_skill_exec_and_pack(task: &TaskAssign, start: Instant) -> TaskResul
                 tool: tool_name_opt,
                 result_sha256: None,
                 stderr_tail: None,
+                python_used: None,
+                failure_class: Some(failure_class::FailureClass::ScriptError.as_str().to_string()),
+                missing_dep: None,
             };
         }
     };
@@ -222,25 +279,43 @@ async fn run_skill_exec_and_pack(task: &TaskAssign, start: Instant) -> TaskResul
             skill_id,
             tool: Some(tool_name.to_string()),
             result_sha256: Some(result_sha256),
-            stderr_tail,
+            stderr_tail: stderr_tail.clone(),
+            python_used: None,
+            // 8.1.8 · tool 非零退出时分类
+            failure_class: if exit_code == 0 {
+                None
+            } else {
+                Some(failure_class::classify(Some(exit_code), stderr_tail.as_deref().unwrap_or(""), &format!("tool exit {}", exit_code)).class.as_str().to_string())
+            },
+            missing_dep: if exit_code == 0 {
+                None
+            } else {
+                failure_class::classify(Some(exit_code), stderr_tail.as_deref().unwrap_or(""), "").missing_dep
+            },
         },
-        Err(e) => TaskResult {
+        Err(e) => {
+            let emsg = e.to_string();
+            let c = failure_class::classify(None, "", &emsg);
+            TaskResult {
             task_id: task.task_id.clone(),
             ok: false,
             elapsed_ms: start.elapsed().as_millis() as u64,
             output: String::new(),
-            error: Some(e.to_string()),
+            error: Some(emsg),
             exit_code: None,
             skill_id,
             tool: Some(tool_name.to_string()),
             result_sha256: None,
             stderr_tail: None,
-        },
+            python_used: None,
+            failure_class: Some(c.class.as_str().to_string()),
+            missing_dep: c.missing_dep,
+        }},
     }
 }
 
 /// 旧 shell 模式：args.cmd 直接 bash -c
-async fn run_shell(task: &TaskAssign, timeout: Duration) -> Result<(String, i32)> {
+async fn run_shell(task: &TaskAssign, timeout: Duration) -> Result<RunOutcome> {
     let cmd = task
         .args
         .get("cmd")
@@ -292,7 +367,7 @@ async fn run_v2_skill(
     entry_file: std::path::PathBuf,
     tool_name: String,
     timeout: Duration,
-) -> Result<(String, i32)> {
+) -> Result<RunOutcome> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
@@ -356,6 +431,7 @@ async fn run_v2_skill(
 
     // 6. 逐个候选 try-spawn (Win venv 起不来自动退下一个) + 喉 stdin
     let mut child_opt = None;
+    let mut used_py = String::new();
     let mut last_err = String::new();
     let total = candidates.len();
     for (i, (python_bin, bundled_pythonpath)) in candidates.iter().enumerate() {
@@ -367,6 +443,7 @@ async fn run_v2_skill(
                         i, i, python_bin
                     );
                 }
+                used_py = python_bin.clone();
                 child_opt = Some(c);
                 break;
             }
@@ -402,18 +479,19 @@ async fn run_v2_skill(
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let exit_code = output.status.code().unwrap_or(-1);
             // stderr 走 tracing · 不污染业务输出
+            let stderr_tail = tail_stderr(&output.stderr, 2048);
             if !output.stderr.is_empty() {
                 let s = String::from_utf8_lossy(&output.stderr);
                 let preview: String = s.chars().take(500).collect();
                 tracing::warn!("v2 skill stderr (task={}): {}", task.task_id, preview);
             }
-            Ok((stdout, exit_code))
+            Ok(RunOutcome { output: stdout, exit_code, stderr_tail, python_used: used_py })
         }
     }
 }
 
 /// M3.6 script 模式：拉 code_url → 写到临时文件 → 用 runtime 执行
-async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<(String, i32)> {
+async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<RunOutcome> {
     let runtime = if task.runtime.is_empty() {
         "python3".to_string()
     } else {
@@ -824,6 +902,7 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<(String, i32
             // 2026-05-18 · 只返 stdout (脚本约定 stdout = JSON 结果)
             // stderr 走本地 tracing (PIL warnings 等不污染 output_ref · 避免 aggregator parse 失败)
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr_tail = tail_stderr(&output.stderr, 2048);
             if !output.stderr.is_empty() {
                 let stderr_str = String::from_utf8_lossy(&output.stderr);
                 tracing::warn!(
@@ -832,12 +911,17 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<(String, i32
                     if stderr_str.len() > 500 { &stderr_str[..500] } else { &stderr_str }
                 );
             }
-            Ok((stdout, output.status.code().unwrap_or(-1)))
+            Ok(RunOutcome {
+                output: stdout,
+                exit_code: output.status.code().unwrap_or(-1),
+                stderr_tail,
+                python_used: used_py,
+            })
         }
     }
 }
 
-async fn run_llm_infer(task: &TaskAssign, timeout: Duration) -> Result<(String, i32)> {
+async fn run_llm_infer(task: &TaskAssign, timeout: Duration) -> Result<RunOutcome> {
     let prompt = task
         .args
         .get("prompt")
@@ -875,10 +959,10 @@ async fn run_llm_infer(task: &TaskAssign, timeout: Duration) -> Result<(String, 
         .map_err(|_| anyhow!("LLM 推理超时（{}秒）", timeout.as_secs()))?
         .map_err(|e| anyhow!("LLM 推理失败: {}", e))?;
 
-    Ok((result.content, 0))
+    Ok(RunOutcome::plain(result.content, 0))
 }
 
-async fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<(String, i32)> {
+async fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<RunOutcome> {
     let child_result = tokio::time::timeout(timeout, async {
         let output = command.output().await?;
         Ok::<_, std::io::Error>(output)
@@ -889,6 +973,8 @@ async fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<(St
         Err(_timeout) => Err(anyhow!("任务执行超时（{}秒）", timeout.as_secs())),
         Ok(Err(io_err)) => Err(anyhow!("启动失败: {}", io_err)),
         Ok(Ok(output)) => {
+            // 8.1.8 · 把 stderr 单独保留到 RunOutcome (output 仍保留 inline 兼容老逻辑)
+            let stderr_tail = tail_stderr(&output.stderr, 2048);
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
             if !output.stderr.is_empty() {
@@ -898,7 +984,12 @@ async fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<(St
                 combined.push_str("--- stderr ---\n");
                 combined.push_str(&String::from_utf8_lossy(&output.stderr));
             }
-            Ok((combined, output.status.code().unwrap_or(-1)))
+            Ok(RunOutcome {
+                output: combined,
+                exit_code: output.status.code().unwrap_or(-1),
+                stderr_tail,
+                python_used: String::new(),
+            })
         }
     }
 }

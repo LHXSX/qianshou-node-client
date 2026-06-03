@@ -1,8 +1,10 @@
 pub mod executor;
+pub mod failure_class;
 pub mod llm_ollama;
 pub mod llm_runtime;
 pub mod pull_worker;  // W1-7 · 节点端 PULL 模式后台抢任务
 pub mod resource_limit;
+pub mod self_heal;
 pub mod skill_pack;
 pub mod skill_registry;
 pub mod tool_caller;
@@ -110,4 +112,14 @@ pub struct TaskResult {
     /// V4 skill_exec 回报：stderr 尾部（最多 2 KiB，出错时辅助定位）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_tail: Option<String>,
+    /// 8.1.8 (2026-06-03) · 实际启动的 Python 解释器绝对路径 (Win 103 关键证据)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_used: Option<String>,
+    /// 8.1.8 · 失败分类 (env_missing_pkg/env_broken_venv/resource_oom/script_error/...)
+    /// 后端 aggregator 据此区分对待:环境问题不判节点"不胜任",硬件不足才降级
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    /// 8.1.8 · 缺失依赖名 (pip 包名 / 系统工具名) · 供后端记录 + 节点自愈
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_dep: Option<String>,
 }

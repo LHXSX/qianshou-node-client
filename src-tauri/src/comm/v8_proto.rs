@@ -77,6 +77,19 @@ pub struct ShardResultPayload {
     pub elapsed_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    // 8.1.8 (2026-06-03) · 失败诊断三件套 (后端 aggregator 拼进 we_shards.error)
+    // 全 optional · 老服务端不读 · 完全向后兼容
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr_tail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub python_used: String,
+    // 8.1.8 · 失败分类 + 缺失依赖 (后端写 we_shards.failure_class · 调度据此区分对待)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failure_class: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub missing_dep: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
