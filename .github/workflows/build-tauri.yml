@@ -226,10 +226,24 @@ jobs:
       - name: Stage release files
         shell: bash
         run: |
+          VER="${{ steps.ver.outputs.VERSION }}"
           mkdir -p _stage
-          find _artifacts -type f \( -name '*.exe' -o -name '*.exe.sig' \
-            -o -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \) \
-            -exec cp -f {} _stage/ \;
+          # 安装器/exe 已带版本+arch · 直接拷(dmg×2 + win exe + sig)
+          find _artifacts -type f \( -name '*.dmg' -o -name '*x64-setup.exe' \
+            -o -name '*x64-setup.exe.sig' \) -exec cp -f {} _stage/ \;
+          # macOS updater bundle 名固定为「千手节点.app.tar.gz」(无 arch)· arm/intel 会互相覆盖,
+          # 故按 label artifact 目录分别重命名成带 arch 的名字(对齐 binary.json/release.json 约定)。
+          stage_appgz() {  # $1=label  $2=arch 后缀
+            local d f
+            d="$(find _artifacts -maxdepth 1 -type d -name "tauri-build-$1" | head -1)"
+            [ -z "$d" ] && { echo "  (无 $1 artifact)"; return 0; }
+            f="$(find "$d" -name '千手节点.app.tar.gz' | head -1)"
+            [ -z "$f" ] && { echo "  ($1 无 app.tar.gz)"; return 0; }
+            cp -f "$f" "_stage/千手节点_${VER}_$2.app.tar.gz"
+            [ -f "$f.sig" ] && cp -f "$f.sig" "_stage/千手节点_${VER}_$2.app.tar.gz.sig"
+          }
+          stage_appgz macos-arm64 aarch64
+          stage_appgz macos-intel x64
           echo "=== staged ==="; ls -la _stage/
           ls _stage/*x64-setup.exe >/dev/null 2>&1 || { echo "✗ 缺 Windows .exe · 中止发布"; exit 1; }
           ls _stage/*aarch64.app.tar.gz >/dev/null 2>&1 || { echo "✗ 缺 mac arm OTA payload · 中止发布"; exit 1; }
