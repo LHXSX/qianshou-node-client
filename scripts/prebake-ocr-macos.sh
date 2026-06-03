@@ -54,6 +54,7 @@ if ! brew list tesseract &>/dev/null; then
   brew install tesseract
 fi
 BREW_TESS_PREFIX="$(brew --prefix tesseract)"
+BREW_PREFIX="$(brew --prefix)"           # /opt/homebrew(arm) · 用于解析 @rpath 依赖
 SRC_TESS="$BREW_TESS_PREFIX/bin/tesseract"
 [[ -f "$SRC_TESS" ]] || { echo "ERROR: 未找到 $SRC_TESS" >&2; exit 3; }
 
@@ -65,47 +66,60 @@ echo "[1/5] 拷 tesseract: $SRC_TESS"
 cp "$SRC_TESS" "$TESS_DIR/tesseract"
 chmod 0755 "$TESS_DIR/tesseract"
 
-# ── 2. BFS 重定位全部非系统 dylib → @executable_path/libs/ ────────────────────
-# 系统库(/usr/lib /System)保持原样不拷;其余(/opt/homebrew /usr/local/Cellar 等)
-# 递归拷进 libs/ 并把所有引用 install_name_tool 改成 @executable_path/libs/<basename>。
-echo "[2/5] 重定位 dylib(@executable_path/libs/)"
-# 注意: macOS 自带 /bin/bash 仍是 3.2(无 declare -A 关联数组)· 用"dest 文件是否已存在"
-# 做去重(basename 在 tesseract/leptonica 依赖里唯一),普通索引数组做 BFS 队列(3.2 兼容)。
-is_system_lib() { case "$1" in /usr/lib/*|/System/*) return 0;; *) return 1;; esac; }
+# ── 2. 重定位全部非系统 dylib(主二进制→@executable_path/libs · 库间→@loader_path) ──
+# 关键: Homebrew 部分库用 @rpath/libX.dylib 引用同伴(如 libwebp→@rpath/libsharpyuv),
+# 绝不能跳过 @-前缀依赖,否则该库不被拷 → dyld "Library not loaded" → Abort trap:6。
+# 故对 @rpath/@loader_path/@executable_path 依赖按 basename 到 Homebrew lib 目录解析后照拷。
+echo "[2/5] 重定位 dylib(主→@executable_path/libs · 库间→@loader_path)"
+# macOS 自带 /bin/bash 仍是 3.2(无 declare -A)· 用"dest 文件已存在"去重 · 索引数组做 BFS。
 
-QUEUE=("$TESS_DIR/tesseract")
+# 把依赖串解析成绝对源文件路径(系统库/解析不到 → 返回非 0)
+resolve_dep_src() {
+  local dep="$1" base d; base="$(basename "$dep")"
+  case "$dep" in
+    /usr/lib/*|/System/*) return 1 ;;                 # 系统库,保持原样不拷
+    @*)                                                # @rpath/@loader_path/@executable_path
+      for d in "$BREW_PREFIX"/lib "$BREW_PREFIX"/opt/*/lib; do
+        [ -f "$d/$base" ] && { printf '%s\n' "$d/$base"; return 0; }
+      done
+      return 1 ;;
+    *) [ -f "$dep" ] && { printf '%s\n' "$dep"; return 0; } || return 1 ;;
+  esac
+}
 
-# 把 target 的全部非系统依赖改写成 @executable_path/libs/,并把依赖本体拷进 libs/ 入队递归
+QUEUE=()
+
+# 改写 target 的非系统依赖为可重定位路径并拷依赖本体入队。
+# is_main=1 → 主二进制(@executable_path/libs/);=0 → 库(同目录 @loader_path/)。
 process_refs() {
-  local target="$1"
-  # otool -L 第一行是文件名自身(跳过);dylib 第二行是其 LC_ID(已改写后以 @ 开头会被跳过)
-  local deps dep base dest_lib
+  local target="$1" is_main="$2"
+  local deps dep base ref src dest_lib
   deps="$(otool -L "$target" 2>/dev/null | tail -n +2 | awk '{print $1}')"
   while IFS= read -r dep; do
     [ -z "$dep" ] && continue
-    case "$dep" in @*) continue;; esac        # 已是 @executable_path/@loader_path/@rpath
-    is_system_lib "$dep" && continue
+    case "$dep" in /usr/lib/*|/System/*) continue ;; esac   # 系统库不动
     base="$(basename "$dep")"
+    if [ "$is_main" = "1" ]; then ref="@executable_path/libs/$base"; else ref="@loader_path/$base"; fi
+    install_name_tool -change "$dep" "$ref" "$target" 2>/dev/null || true
     dest_lib="$LIBS_DIR/$base"
-    install_name_tool -change "$dep" "@executable_path/libs/$base" "$target" 2>/dev/null || true
-    # dest 已存在即代表此依赖已拷贝并入队过 → 跳过(去重 + 防环)
-    if [ ! -e "$dest_lib" ]; then
-      if [ -f "$dep" ]; then
-        cp -f "$dep" "$dest_lib" 2>/dev/null || true
+    if [ ! -e "$dest_lib" ]; then                            # 去重 + 防环
+      src="$(resolve_dep_src "$dep" || true)"
+      if [ -n "$src" ]; then
+        cp -f "$src" "$dest_lib" 2>/dev/null || true
         chmod 0644 "$dest_lib" 2>/dev/null || true
-        install_name_tool -id "@executable_path/libs/$base" "$dest_lib" 2>/dev/null || true
+        install_name_tool -id "@loader_path/$base" "$dest_lib" 2>/dev/null || true
         QUEUE+=("$dest_lib")
       else
-        echo "      WARN: 依赖缺失(忽略): $dep" >&2
+        echo "      WARN: 依赖解析不到(忽略): $dep" >&2
       fi
     fi
   done <<< "$deps"
 }
 
-# BFS
+process_refs "$TESS_DIR/tesseract" 1          # 主二进制 · 入队其依赖
 idx=0
-while (( idx < ${#QUEUE[@]} )); do
-  process_refs "${QUEUE[$idx]}"
+while (( idx < ${#QUEUE[@]} )); do            # BFS 处理所有库(含 @rpath 同伴)
+  process_refs "${QUEUE[$idx]}" 0
   idx=$((idx+1))
 done
 echo "      libs: $(ls -1 "$LIBS_DIR" 2>/dev/null | wc -l | tr -d ' ') 个 · $(du -sh "$LIBS_DIR" 2>/dev/null | cut -f1)"
