@@ -121,6 +121,9 @@ async fn spawn_python_tool(
     let build_cmd = |python_bin: &str, bundled_pp: &[std::path::PathBuf]| -> Command {
         let mut command = Command::new(python_bin);
         crate::proc_util::hide_window_tokio(&mut command);
+        // 8.1.10 · skill_exec 路径也强制 UTF-8 IO (对齐 executor.rs · 修 Win stdout GBK)
+        command.env("PYTHONIOENCODING", "utf-8");
+        command.env("PYTHONUTF8", "1");
         command
             .arg(entry_file)
             .current_dir(&skill.dir)

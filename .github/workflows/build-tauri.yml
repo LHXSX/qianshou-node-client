@@ -261,7 +261,7 @@ jobs:
         shell: bash
         run: |
           VER="${{ steps.ver.outputs.VERSION }}"
-          NOTES="${VER} · 修复 Windows 节点根因 + 8.1.8 回归:① 【根因·重大】Win python 子进程强制 PYTHONIOENCODING=utf-8/PYTHONUTF8=1 — 修 Win stdout 默认 GBK 编码导致脚本输出 emoji/中文时 UnicodeEncodeError→exit 1(这是'Mac 全成功·Win 全失败·跨版本'的真正根因,Mac/Linux 默认 UTF-8 不受影响)② 【回归】能力探针改非阻塞(后台专线预热+主循环只读缓存)— 修 8.1.8 探针同步阻塞 WS 主循环导致节点收任务不回结果(watchdog timeout 黑洞)"
+          NOTES="${VER} · 【彻底修复 Windows exit 103 根因】① 真凶:bundled/镜像 venv 的 pyvenv.cfg 把母 Python 路径写死成 CI 构建机路径(D:\\a\\... · Win venv 不可重定位),拷到用户机找不到基座解释器→exit 103(进程没起来·跟编码无关)。新增 fix_venv_pyvenv_cfg:首启检测并把 venv home/executable/command 重写为本地 CPython 路径(复制后+跳过复制分支都修·持久化)② skill_exec 路径(tool_caller)补 PYTHONIOENCODING=utf-8/PYTHONUTF8=1,三条 python 路径全齐"
           NOTES_B64="$(printf '%s' "$NOTES" | base64 | tr -d '\n')"
           H=root@47.86.60.178; K=~/.ssh/ci_deploy
           tar -czf _stage.tar.gz -C _stage .

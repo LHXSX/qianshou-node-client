@@ -74,6 +74,98 @@ fn remove_bundled_cpython(dest: &Path) {
     }
 }
 
+/// 8.1.10 · 修复 bundled venv 的 pyvenv.cfg · 把 CI 构建机路径重写为本地 CPython 路径
+///
+/// 背景: prebake/镜像预建 venv 在 CI 构建机上创建 (D:\a\... / /Users/runner/...),
+///       pyvenv.cfg 中 home/executable/command 写死了 CI 路径。拷贝/下拉到用户机器后,
+///       Windows venv 不可重定位 → venv python 启动时按 home 找基座 Python → 找不到 →
+///       exit 103 (进程没起来) → 所有任务失败。这是 Win 节点 exit 103 的真正根因。
+///
+/// 修复: 遍历 venvs/ 下所有 tier 的 pyvenv.cfg · CI 路径替换为本地 CPython 路径。
+fn fix_venv_pyvenv_cfg(dest: &Path) {
+    let venvs_dir = dest.join("venvs");
+    if !venvs_dir.is_dir() {
+        return;
+    }
+
+    // 本地 CPython 位置 (bundled_python_bin 返回 .../cpython-3.11.10-.../python.exe)
+    let cpython_bin = match paths::bundled_python_bin() {
+        Some(p) => p,
+        None => {
+            tracing::warn!("fix_venv_pyvenv_cfg: 找不到本地 CPython · 跳过");
+            return;
+        }
+    };
+    let cpython_home = match cpython_bin.parent() {
+        Some(p) => p.display().to_string(),
+        None => return,
+    };
+    let cpython_exe = cpython_bin.display().to_string();
+
+    // CI 构建机路径特征 · 三平台
+    let is_ci_path = |s: &str| -> bool {
+        s.contains("D:\\a\\")               // GitHub Actions Windows runner
+            || s.contains("/Users/runner/") // GitHub Actions macOS runner
+            || s.contains("/home/runner/")  // GitHub Actions Linux runner
+    };
+
+    if let Ok(rd) = std::fs::read_dir(&venvs_dir) {
+        for entry in rd.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let cfg_path = entry.path().join("pyvenv.cfg");
+            if !cfg_path.exists() {
+                continue;
+            }
+            match std::fs::read_to_string(&cfg_path) {
+                Ok(content) => {
+                    if !is_ci_path(&content) {
+                        continue; // 非 CI 路径 · 跳过 (如 uv 本机装的 venv)
+                    }
+                    let tier_name = entry.file_name().to_string_lossy().into_owned();
+                    tracing::info!(
+                        "fix_venv_pyvenv_cfg: 修复 venv/{} · CI 路径 → 本地 CPython",
+                        tier_name
+                    );
+                    let fixed = content
+                        .lines()
+                        .map(|line| {
+                            if line.starts_with("home = ") && is_ci_path(line) {
+                                format!("home = {}", cpython_home)
+                            } else if line.starts_with("executable = ") && is_ci_path(line) {
+                                format!("executable = {}", cpython_exe)
+                            } else if line.starts_with("command = ") && is_ci_path(line) {
+                                let rest = if let Some(idx) = line.find(" -m venv ") {
+                                    &line[idx..]
+                                } else {
+                                    ""
+                                };
+                                format!("command = {}{}", cpython_exe, rest)
+                            } else {
+                                line.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if let Err(e) = std::fs::write(&cfg_path, fixed) {
+                        tracing::warn!(
+                            "fix_venv_pyvenv_cfg: 写 {} 失败: {}",
+                            cfg_path.display(), e
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "fix_venv_pyvenv_cfg: 读 {} 失败: {}",
+                        cfg_path.display(), e
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// 2026-05-28 v8.1.3 · 归一化 platform label · 兼容老 8.0.x 用 Python triple
 /// 历史标签:
 ///   8.0.x 老 prebake.sh 写: "aarch64-apple-darwin" / "x86_64-apple-darwin" /
@@ -163,6 +255,8 @@ pub async fn ensure_bundled_runtime(app: &AppHandle) -> Result<()> {
             // 平台一致 · 仅当 bundle 的 python / 烘焙批次变化时才刷新
             // (升级带了新版 bundled Python → 刷 cpython · 但保留用户 venvs + installed.json 记录)
             if src_id.python == dest_id.python && src_id.bundled_at == dest_id.bundled_at {
+                // 8.1.10 · 即使跳过复制 · 也修已有 venv 的 pyvenv.cfg CI 路径 (持久化修复)
+                fix_venv_pyvenv_cfg(&dest);
                 tracing::debug!(
                     "bundled runtime 已最新 (python={} bundled_at={}) · 跳过 bootstrap",
                     dest_id.python, dest_id.bundled_at
@@ -239,6 +333,9 @@ pub async fn ensure_bundled_runtime(app: &AppHandle) -> Result<()> {
         t0.elapsed().as_secs_f64(),
         preserve_venvs.len()
     );
+
+    // ── 3.5 · 修复 bundled venv 的 pyvenv.cfg CI 路径 → 本地 CPython (修 Win exit 103 根因) ──
+    fix_venv_pyvenv_cfg(&dest);
 
     // 4. 写 installed.json (让 WS hello 上报 image tier 已就绪)
     write_installed_meta(&dest).ok();
