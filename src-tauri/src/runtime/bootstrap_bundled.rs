@@ -510,27 +510,6 @@ fn write_installed_meta(_dest: &PathBuf) -> Result<()> {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    // imageio_ffmpeg 自带 ffmpeg static binary · 探测路径
-    let ffmpeg_bin = paths::bundled_site_packages("image")
-        .and_then(|sp| {
-            let bin_dir = sp.join("imageio_ffmpeg").join("binaries");
-            std::fs::read_dir(&bin_dir).ok().and_then(|it| {
-                it.filter_map(|e| e.ok())
-                    .find(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .starts_with("ffmpeg-")
-                    })
-                    .map(|e| e.path().to_string_lossy().into_owned())
-            })
-        })
-        .unwrap_or_default();
-
-    let mut binaries: BTreeMap<String, String> = BTreeMap::new();
-    if !ffmpeg_bin.is_empty() {
-        binaries.insert("ffmpeg".into(), ffmpeg_bin);
-    }
-
     // 2026-05-28 · 复用 current_platform_label() 顶层定义 · 跟 ensure_bundled_runtime 校验逻辑统一
     //              注意: detector.InstalledMeta.platform 老格式是 macos-arm64 (不带 e) · 这里保留兼容
     //              ensure_bundled_runtime 用的 macos-aarch64 是 bundle prebake manifest 的字段
@@ -541,31 +520,13 @@ fn write_installed_meta(_dest: &PathBuf) -> Result<()> {
 
     let mut tiers: BTreeMap<String, InstalledTier> = BTreeMap::new();
 
-    // 老 image tier (8.0.x 兼容 · 保留)
-    tiers.insert(
-        "image".into(),
-        InstalledTier {
-            ok: true,
-            python: python_bin.clone(),
-            packages: vec![
-                "pillow", "numpy", "onnxruntime", "pymupdf", "pdfplumber", "imageio-ffmpeg",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            software: vec![
-                "pillow", "numpy", "onnxruntime", "pymupdf", "pdfplumber", "ffmpeg",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            mirror_label: "bundled".into(),
-            installed_at: chrono::Utc::now().to_rfc3339(),
-            last_message: "已从客户端内置 runtime 解压安装 · 开箱即用 · 无需联网".into(),
-            binaries,
-            installed_skills: BTreeMap::new(),
-        },
-    );
+    // 2026-06-05 · 删除谎报的 image tier:
+    //   8.0.x 时 bundle 内置 envs/image site-packages → 无条件标 image ok 合理。
+    //   V8.1.5 改为只内置 cpython+uv(不内置任何 venv)后,此标记变谎报:
+    //   声称 pillow/numpy/... 6 个包,实际 python 指向裸 cpython(只有 pip+setuptools)。
+    //   且后端 v8.1.5 manifest 已无 image tier · 图像任务(image_resize 等)归 lite tier,
+    //   lite venv(auto_install)真有这些包 · python_candidates 路由会让 image_* 落 lite venv 跑成功。
+    //   故移除此谎报 tier · 让上报真实(图像能力由下方 lite tier 提供)。
 
     // 2026-05-28 v8.1.2 · prebake-runtime.sh 已烘焙 lite + crawl venv 进 bundle
     // 节点首启 bootstrap 拷过来后这两个 venv 已就绪 · 标 ok · ws hello 上报 software
