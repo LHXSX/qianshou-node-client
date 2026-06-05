@@ -47,6 +47,12 @@ export interface RuntimeTierSpec {
   system_commands?: string[]
   /** 2026-05-24 · 探测失败时显示的安装指引 · key 为 macos/linux/windows */
   install_hint?: Partial<Record<"macos" | "linux" | "windows", string>>
+  /** 2026-06-05 硬件感知门控 · 后端 manifest 下发 · 客户端按本机硬件标记 fit */
+  requires_gpu?: boolean
+  requires_cuda?: boolean
+  requires_metal?: boolean
+  min_ram_gb?: number
+  min_vram_gb?: number
 }
 
 export interface RuntimeManifest {

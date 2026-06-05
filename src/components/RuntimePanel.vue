@@ -11,6 +11,7 @@
  */
 import { computed } from "vue"
 import { useRuntime, type RuntimeTierSpec } from "../composables/useRuntime"
+import { useDevice } from "../composables/useDevice"
 import Icon from "./Icon.vue"
 import type { IconName } from "../icons/paths"
 
@@ -20,7 +21,66 @@ const {
   installTier, uninstallTier, recheckTier, statusOf, logsForTier, tierJob,
 } = useRuntime()
 
+const { device } = useDevice()
+
 import { ref as vueRef, computed as vueComputed } from "vue"
+
+// 2026-06-05 硬件感知:已确认"了解风险仍要装"的 tier (绕过 incompatible 门控)
+const forceInstall = vueRef<Record<string, boolean>>({})
+
+// 本机硬件画像 (供配置卡 + fit 分级)
+const hw = vueComputed(() => {
+  const s = device.value?.system
+  return {
+    cpu: s?.cpu_brand || "未知 CPU",
+    cores: s?.cpu_cores ?? 0,
+    ramGb: s ? Math.round(s.total_memory_mb / 1024) : 0,
+    hasGpu: s?.has_gpu ?? false,
+    gpuModel: s?.gpu_model || "",
+    vramGb: s?.gpu_vram_gb ?? 0,
+    platform: (manifest.value?.platform || s?.arch || "") as string,
+    ready: !!s,
+  }
+})
+
+type FitLevel = "recommended" | "optional" | "incompatible"
+interface FitResult { level: FitLevel; reason: string }
+
+// 按本机硬件 vs tier 要求算适配等级 (device 未就绪时一律不判 incompatible · 防误禁)
+function fitOf(spec: RuntimeTierSpec): FitResult {
+  const h = hw.value
+  if (h.ready) {
+    if (spec.requires_gpu && !h.hasGpu) {
+      return { level: "incompatible", reason: "需要 GPU · 本机无独立显卡" }
+    }
+    if (spec.min_ram_gb && h.ramGb > 0 && h.ramGb < spec.min_ram_gb) {
+      return { level: "incompatible", reason: `需 ${spec.min_ram_gb}GB 内存 · 本机 ${h.ramGb}GB` }
+    }
+    if (spec.requires_gpu && spec.min_vram_gb && h.vramGb > 0 && h.vramGb < spec.min_vram_gb) {
+      return { level: "incompatible", reason: `需 ${spec.min_vram_gb}GB 显存 · 本机 ${h.vramGb.toFixed(1)}GB` }
+    }
+  }
+  // 有硬件门槛但满足 = 可选 (重包 · 占资源)
+  if (spec.requires_gpu || (spec.min_ram_gb && spec.min_ram_gb >= 4)) {
+    return { level: "optional", reason: "可安装 · 资源占用较大" }
+  }
+  // 无门槛轻量 / 必备
+  return { level: "recommended", reason: spec.required ? "必备运行环境" : "推荐安装" }
+}
+
+function fitLabel(level: FitLevel): string {
+  return { recommended: "推荐", optional: "可选", incompatible: "不适合" }[level]
+}
+
+// 安装是否被门控阻挡 (incompatible 且未确认强装)
+function installBlocked(tier: string): boolean {
+  if (forceInstall.value[tier]) return false
+  return fitOf(manifest.value?.tiers?.[tier] as RuntimeTierSpec).level === "incompatible"
+}
+
+function confirmForceInstall(tier: string) {
+  forceInstall.value[tier] = true
+}
 // 打开 "手工安装" 面板的 tier (空 = 不显示)
 const manualOpen = vueRef<string | null>(null)
 const rechecking = vueRef<Record<string, boolean>>({})
@@ -156,12 +216,31 @@ async function copyText(text: string) {
 interface TierRow {
   key: string
   spec: RuntimeTierSpec
+  fit: FitResult
 }
+
+const FIT_ORDER: Record<FitLevel, number> = { recommended: 0, optional: 1, incompatible: 2 }
 
 const tierRows = computed<TierRow[]>(() => {
   const t = manifest.value?.tiers ?? {}
-  return Object.keys(t).map((k) => ({ key: k, spec: t[k] as RuntimeTierSpec }))
+  const rows = Object.keys(t).map((k) => {
+    const spec = t[k] as RuntimeTierSpec
+    return { key: k, spec, fit: fitOf(spec) }
+  })
+  // 推荐 → 可选 → 不适合;同级已装优先靠前 (装好的稳定置顶)
+  return rows.sort((a, b) => {
+    const fa = FIT_ORDER[a.fit.level], fb = FIT_ORDER[b.fit.level]
+    if (fa !== fb) return fa - fb
+    const ra = statusOf(a.key) === "ready" ? 0 : 1
+    const rb = statusOf(b.key) === "ready" ? 0 : 1
+    return ra - rb
+  })
 })
+
+// 顶部统计:不适配数量
+const incompatCount = computed(
+  () => tierRows.value.filter((r) => r.fit.level === "incompatible").length,
+)
 
 const tierMeta: Record<string, { label: string; icon: IconName; gradient: string }> = {
   lite:        { label: "Lite · 轻量包",     icon: "task-text",  gradient: "linear-gradient(135deg, #4f8cff, #6e5cff)" },
@@ -214,6 +293,20 @@ async function refreshAll() {
       </p>
     </header>
 
+    <!-- 2026-06-05 硬件感知 · 本机配置画像 -->
+    <section class="hw-card" v-if="hw.ready">
+      <span class="hw-title"><Icon name="cpu" :size="13" /> 本机配置</span>
+      <div class="hw-item"><span class="hw-k">CPU</span><span class="hw-v">{{ hw.cpu }} · {{ hw.cores }}核</span></div>
+      <div class="hw-item"><span class="hw-k">内存</span><span class="hw-v">{{ hw.ramGb }} GB</span></div>
+      <div class="hw-item">
+        <span class="hw-k">GPU</span>
+        <span class="hw-v" :class="{ none: !hw.hasGpu }">{{ hw.hasGpu ? hw.gpuModel : "无独立显卡" }}</span>
+      </div>
+      <div class="hw-item" v-if="hw.hasGpu && hw.vramGb > 0"><span class="hw-k">显存</span><span class="hw-v">{{ hw.vramGb.toFixed(1) }} GB</span></div>
+      <div class="hw-item"><span class="hw-k">平台</span><span class="hw-v">{{ hw.platform }}</span></div>
+      <span class="hw-hint">按配置推荐能力 · 不适合的已标注</span>
+    </section>
+
     <div v-if="error" class="err-block">⚠ {{ error }}</div>
 
     <!-- 卡片网格 -->
@@ -244,6 +337,7 @@ async function refreshAll() {
             {{ tierMetaOf(row.key).label }}
             <span v-if="row.spec.required" class="tc-req">必装</span>
             <span v-if="row.spec.auto_install" class="tc-auto" title="客户端首次启动自动安装 · 无需手动点">自动</span>
+            <span class="tc-fit" :class="`fit-${row.fit.level}`" :title="row.fit.reason">{{ fitLabel(row.fit.level) }}</span>
           </div>
           <div class="tc-desc">{{ row.spec.description }}</div>
 
@@ -267,18 +361,30 @@ async function refreshAll() {
 
         <!-- 卡片底部按钮 -->
         <div class="tc-actions">
+          <!-- 已装 → 移除 -->
+          <button v-if="statusOf(row.key) === 'ready'" class="tc-btn ghost" @click="uninstallTier(row.key)">
+            <Icon name="action-trash" :size="14" />
+            移除
+          </button>
+          <!-- 2026-06-05 硬件感知:不适合本机且未确认强装 → 禁用 + 原因 + 二次确认 -->
+          <div v-else-if="installBlocked(row.key)" class="tc-gate">
+            <button class="tc-btn primary" disabled :title="row.fit.reason">
+              <Icon name="action-install" :size="14" />
+              不适合本机
+            </button>
+            <button class="tc-force" @click="confirmForceInstall(row.key)" :title="`${row.fit.reason}（强装可能卡死/失败）`">
+              {{ row.fit.reason }} · 仍要安装
+            </button>
+          </div>
+          <!-- 正常安装 (含已确认强装) -->
           <button
-            v-if="statusOf(row.key) !== 'ready'"
+            v-else
             class="tc-btn primary"
             :disabled="!!tierJob[row.key]"
             @click="installTier(row.key)"
           >
             <Icon name="action-install" :size="14" />
-            {{ tierJob[row.key] ? "安装中…" : "一键安装" }}
-          </button>
-          <button v-else class="tc-btn ghost" @click="uninstallTier(row.key)">
-            <Icon name="action-trash" :size="14" />
-            移除
+            {{ tierJob[row.key] ? "安装中…" : (forceInstall[row.key] ? "仍要安装" : "一键安装") }}
           </button>
         </div>
 
@@ -473,6 +579,44 @@ async function refreshAll() {
   color: var(--c-err);
   font-size: var(--fs-sm);
 }
+
+/* ── 2026-06-05 本机配置卡 ── */
+.hw-card {
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-5);
+  background: var(--c-bg-card);
+  border: 1px solid var(--c-line);
+  border-radius: var(--r-md);
+  padding: var(--sp-4) var(--sp-5);
+}
+.hw-title {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: var(--fs-2xs); font-weight: var(--fw-semibold);
+  text-transform: uppercase; letter-spacing: 0.06em; color: var(--c-mute);
+}
+.hw-item { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); }
+.hw-k { color: var(--c-mute); }
+.hw-v { color: var(--c-fg); font-weight: var(--fw-medium); font-family: ui-monospace, monospace; }
+.hw-v.none { color: var(--c-warn); }
+.hw-hint { margin-left: auto; font-size: var(--fs-2xs); color: var(--c-faint); }
+
+/* ── fit 徽章 ── */
+.tc-fit {
+  font-size: var(--fs-2xs); padding: 1px 6px; border-radius: var(--r-xs);
+  font-weight: var(--fw-bold); margin-left: auto;
+}
+.tc-fit.fit-recommended { background: var(--c-ok-soft);   color: var(--c-ok); }
+.tc-fit.fit-optional     { background: var(--c-info-soft); color: var(--c-info); }
+.tc-fit.fit-incompatible { background: var(--c-warn-soft); color: var(--c-warn); }
+
+/* ── 门控:不适合本机 ── */
+.tc-gate { display: flex; flex-direction: column; gap: 5px; width: 100%; }
+.tc-force {
+  background: transparent; border: none;
+  color: var(--c-faint); font-size: var(--fs-2xs);
+  text-decoration: underline; cursor: pointer; text-align: center;
+  padding: 2px;
+}
+.tc-force:hover { color: var(--c-warn); }
 
 /* ── tier grid (紧凑) ── */
 .tier-grid {

@@ -12,6 +12,12 @@ export interface SystemInfo {
   cpu_threads: number
   total_memory_mb: number
   arch: string
+  // 2026-06-05 硬件感知:GPU/加速器画像
+  has_gpu: boolean
+  gpu_model: string
+  gpu_vram_gb: number
+  supports_cuda: boolean
+  supports_metal: boolean
 }
 
 export interface DeviceOverview {

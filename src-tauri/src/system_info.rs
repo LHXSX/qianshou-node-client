@@ -15,6 +15,12 @@ pub struct SystemInfo {
     pub cpu_threads: usize,
     pub total_memory_mb: u64,
     pub arch: &'static str,
+    // 2026-06-05 硬件感知:GPU/加速器画像(工具管理按本机硬件推荐/门控 tier)
+    pub has_gpu: bool,
+    pub gpu_model: String,
+    pub gpu_vram_gb: f32,
+    pub supports_cuda: bool,
+    pub supports_metal: bool,
 }
 
 pub fn collect() -> SystemInfo {
@@ -37,6 +43,19 @@ pub fn collect() -> SystemInfo {
 
     let arch = std::env::consts::ARCH;
 
+    // 2026-06-05 硬件感知:复用 hardware_capabilities 探测 GPU/加速器
+    let caps = crate::hardware_capabilities::detect();
+    let has_gpu = caps.supports_cuda || caps.supports_metal || caps.supports_rocm;
+    let gpu_model = if caps.supports_cuda {
+        "NVIDIA CUDA GPU".to_string()
+    } else if caps.supports_metal {
+        "Apple Silicon (Metal)".to_string()
+    } else if caps.supports_rocm {
+        "AMD ROCm GPU".to_string()
+    } else {
+        String::new()
+    };
+
     SystemInfo {
         device_name: hostname.clone(),
         hostname,
@@ -48,5 +67,10 @@ pub fn collect() -> SystemInfo {
         cpu_threads,
         total_memory_mb,
         arch,
+        has_gpu,
+        gpu_model,
+        gpu_vram_gb: caps.gpu_vram_gb,
+        supports_cuda: caps.supports_cuda,
+        supports_metal: caps.supports_metal,
     }
 }
