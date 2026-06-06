@@ -172,6 +172,36 @@ for m in sys.argv[1:]:
     out
 }
 
+/// 2026-06-06 · 验证 ffmpeg tier 的 imageio-ffmpeg (ffmpeg binary 在 venv 内·系统 which 找不到)
+/// 用 venv python 跑 imageio_ffmpeg.get_ffmpeg_exe() · binary 文件存在则 ffmpeg 真可用。
+fn probe_ffmpeg_via_imageio(venv_py: &str) -> bool {
+    use std::process::{Command as StdCommand, Stdio};
+    let mut cmd = StdCommand::new(venv_py);
+    cmd.arg("-c").arg(
+        "import imageio_ffmpeg,os,sys; p=imageio_ffmpeg.get_ffmpeg_exe(); sys.exit(0 if (p and os.path.exists(p)) else 1)",
+    );
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    crate::proc_util::hide_window_std(&mut cmd);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 /// 对单个 tier 做真实探针 · 返回**验证通过**的 software 子集
 pub fn probe_tier_software(tier: &InstalledTier) -> Vec<String> {
     let mut verified: Vec<String> = Vec::new();
@@ -180,6 +210,13 @@ pub fn probe_tier_software(tier: &InstalledTier) -> Vec<String> {
     for sw in &tier.software {
         if is_system_tool(sw) {
             if which::which(sw).is_ok() {
+                verified.push(sw.clone());
+            } else if sw == "ffmpeg"
+                && !tier.python.is_empty()
+                && probe_ffmpeg_via_imageio(&tier.python)
+            {
+                // 2026-06-06 · imageio-ffmpeg 的 ffmpeg 在 venv 内(不在系统 PATH)·which 找不到
+                // 用 venv python 跑 imageio_ffmpeg.get_ffmpeg_exe() 验证 → 修 ffmpeg 内置不上报导致任务派不出
                 verified.push(sw.clone());
             }
         } else {
