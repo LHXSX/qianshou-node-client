@@ -128,26 +128,12 @@ if [[ "$PLATFORM" != "windows-x64" ]]; then
 fi
 echo "      → $UV_DEST ($(du -sh "$UV_DEST" | cut -f1))"
 
-# ─── 3. 写 manifest.json ────────────────────────────────────────────────
-# V8.1.5 内置 cpython + uv · 不内置 venv · venv 首启从镜像/公共源装
-cat > "$DEST_RESOURCES/runtime/manifest.json" << EOF
-{
-  "schema_version": 2,
-  "bundled_at": "$(date -u +%Y-%m-%d)",
-  "python": "${PY_VERSION}",
-  "uv": "${UV_VERSION}",
-  "platform": "${PLATFORM_LABEL}",
-  "bundled_venvs": [],
-  "mirror_base": "https://by.wujisuanli.com",
-  "note": "内置 cpython + uv · venv 首启从 by.wujisuanli.com 下拉(缺则公共源) · 更新不删已装"
-}
-EOF
-echo "[3/3] 写 $DEST_RESOURCES/runtime/manifest.json (platform=$PLATFORM_LABEL · cpython+uv · venvs 走镜像)"
-
-# ─── 校验: bundled_python_bin 能不能找到 ──────────────────────────────────
+# ─── 3. 校验 cpython / uv 落地 (venv 预建依赖这俩) ────────────────────────
 EXPECTED_PY_BIN="$CPYTHON_TARGET/bin/python3.11"
+VENV_PY_REL="bin/python"
 if [[ "$PLATFORM" == "windows-x64" ]]; then
     EXPECTED_PY_BIN="$CPYTHON_TARGET/python.exe"
+    VENV_PY_REL="Scripts/python.exe"
 fi
 if [[ ! -f "$EXPECTED_PY_BIN" ]]; then
     echo "WARN: 预期 python 二进制不存在: $EXPECTED_PY_BIN" >&2
@@ -155,13 +141,58 @@ if [[ ! -f "$EXPECTED_PY_BIN" ]]; then
     ls -la "$CPYTHON_TARGET" >&2 || true
     exit 4
 fi
-
-# uv 必须落地 · 否则客户端内置 uv 失效 (退化运行时下载)
 if [[ ! -f "$UV_DEST" ]]; then
     echo "WARN: 预期 uv 二进制不存在: $UV_DEST" >&2
     echo "      uv.rs::ensure_uv 会退化到镜像/GitHub 运行时下载" >&2
     exit 6
 fi
+
+# ─── 4. 预建内置 venv (V8.1.13 · hybrid 分层内置) ────────────────────────
+# lite/crawl/ffmpeg 三个轻量常用 tier 直接打进安装包 · 开箱即用 · 0 网络 · 90% 任务零环境错误。
+# ocr/vision-ai/render(重·部分 Win 难装) 维持首启镜像下拉。
+# 单 tier pip 失败 → 跳过该 tier(首启走镜像兜底) · 不阻断整体构建。
+# pyvenv.cfg 的 CI 路径由节点首启 bootstrap_bundled::fix_venv_pyvenv_cfg 重写为本地 CPython。
+DEST_VENVS="$DEST_RESOURCES/runtime/venvs"
+mkdir -p "$DEST_VENVS"
+BUILT_VENVS=()
+
+prebake_venv() {
+    local tier="$1"; shift
+    local vdir="$DEST_VENVS/$tier"
+    echo "[venv] 预建 $tier: $*"
+    rm -rf "$vdir"
+    if "$UV_DEST" venv "$vdir" --python "$EXPECTED_PY_BIN" \
+        && "$UV_DEST" pip install --python "$vdir/$VENV_PY_REL" "$@"; then
+        BUILT_VENVS+=("\"$tier\"")
+        echo "      ✓ $tier venv 就绪 ($(du -sh "$vdir" 2>/dev/null | cut -f1))"
+    else
+        echo "WARN: $tier venv 预建失败 · 跳过(首启走镜像下拉兜底)" >&2
+        rm -rf "$vdir"
+    fi
+}
+
+# 包清单与 bundles.py / v8_024 tier 定义一致
+prebake_venv lite  pillow numpy onnxruntime PyMuPDF pdfplumber
+prebake_venv crawl requests selectolax tldextract readability-lxml lxml
+prebake_venv ffmpeg imageio-ffmpeg
+
+# 组装 bundled_venvs JSON 数组 (仅成功的)
+BUNDLED_VENVS_JSON=$(IFS=,; echo "${BUILT_VENVS[*]:-}")
+
+# ─── 5. 写 manifest.json (含实际内置的 venv) ──────────────────────────────
+cat > "$DEST_RESOURCES/runtime/manifest.json" << EOF
+{
+  "schema_version": 2,
+  "bundled_at": "$(date -u +%Y-%m-%d)",
+  "python": "${PY_VERSION}",
+  "uv": "${UV_VERSION}",
+  "platform": "${PLATFORM_LABEL}",
+  "bundled_venvs": [${BUNDLED_VENVS_JSON}],
+  "mirror_base": "https://by.wujisuanli.com",
+  "note": "内置 cpython + uv + lite/crawl/ffmpeg venv(hybrid) · 重 tier 首启镜像下拉 · 更新不删已装"
+}
+EOF
+echo "[manifest] 写 $DEST_RESOURCES/runtime/manifest.json (platform=$PLATFORM_LABEL · bundled_venvs=[${BUNDLED_VENVS_JSON}])"
 
 TOTAL=$(du -sh "$DEST_RESOURCES" 2>/dev/null | cut -f1)
 echo ""

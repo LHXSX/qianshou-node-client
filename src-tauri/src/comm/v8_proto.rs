@@ -294,6 +294,38 @@ pub struct PullAssignPayload {
 fn default_pull_next_after() -> u64 { 5000 }
 
 // ════════════════════════════════════════════════════════════════════
+// 自愈 control 帧 (2026-06-05 · 跟 backend ws_schema 对齐)
+//
+// 流向:
+//   server → node (Control · 白名单 action 修复指令)
+//   node → server (ControlResult · 执行回报)
+//
+// 安全: action 严格白名单 (task/control.rs CONTROL_ACTIONS) · 未知 action 拒绝
+// ════════════════════════════════════════════════════════════════════
+#[derive(Debug, Clone, Deserialize)]
+pub struct ControlPayload {
+    pub control_id: String,
+    pub action: String,                                // 白名单: reinstall_tier/fix_venv_cfg/...
+    #[serde(default)]
+    pub params: HashMap<String, Value>,                // {"tier": "ocr"} / {"missing_dep": "..."}
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub expires_at_ms: i64,                            // 过期时间戳 ms (0=不过期) · 防重放
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlResultPayload {
+    pub control_id: String,
+    pub action: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<i64>,
+}
+
+// ════════════════════════════════════════════════════════════════════
 // 帧 envelope (跟 v1 不同 · v8 用扁平结构)
 // ════════════════════════════════════════════════════════════════════
 

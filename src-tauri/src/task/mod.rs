@@ -1,3 +1,4 @@
+pub mod control;       // 2026-06-05 · 后端下发 control 白名单执行器 (自愈)
 pub mod executor;
 pub mod failure_class;
 pub mod llm_ollama;

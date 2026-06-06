@@ -380,10 +380,11 @@ async fn handle_incoming(
                 "v8.ws · pull_assign count={} next_pull_after_ms={} load={:.2}",
                 assign.shards.len(), assign.next_pull_after_ms, assign.server_load_hint
             );
+            // 2026-06-06 · 接 next_pull_after_ms · 让 pull_worker 按 server 限速动态调间隔
+            crate::task::pull_worker::set_next_pull_ms(assign.next_pull_after_ms);
             for sh in assign.shards {
                 spawn_shard_task(sh, outbound_tx, active_shards, state, app, worker_id).await;
             }
-            // TODO P2: 接 next_pull_after_ms · 让 pull_worker 动态调节间隔
             Ok(())
         }
         "shard_cancel" => {
@@ -444,6 +445,32 @@ async fn handle_incoming(
             );
             // emit 给 webview · Vue useOpSlots 监听后重拉
             let _ = app.emit("op_slots:changed", &payload);
+            Ok(())
+        }
+        // 2026-06-05 · 后端自愈 control 指令 (白名单执行器 · spawn 不阻塞 WS 循环 · 回报 control_result)
+        "control" => {
+            let p: super::v8_proto::ControlPayload = match serde_json::from_value(frame.payload) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("v8.ws · control payload 解析失败: {}", e);
+                    return Ok(());
+                }
+            };
+            tracing::info!(
+                "v8.ws ← control id={} action={} reason={}",
+                p.control_id, p.action, p.reason,
+            );
+            let tx = outbound_tx.clone();
+            let app_c = app.clone();
+            tokio::spawn(async move {
+                let res = crate::task::control::execute(app_c, p).await;
+                match serde_json::to_string(&super::v8_proto::OutFrame::new("control_result", res)) {
+                    Ok(frame_json) => {
+                        let _ = tx.send(frame_json);
+                    }
+                    Err(e) => tracing::warn!("v8.ws · control_result 序列化失败: {}", e),
+                }
+            });
             Ok(())
         }
         other => {

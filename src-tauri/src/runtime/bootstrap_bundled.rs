@@ -82,7 +82,7 @@ fn remove_bundled_cpython(dest: &Path) {
 ///       exit 103 (进程没起来) → 所有任务失败。这是 Win 节点 exit 103 的真正根因。
 ///
 /// 修复: 遍历 venvs/ 下所有 tier 的 pyvenv.cfg · CI 路径替换为本地 CPython 路径。
-fn fix_venv_pyvenv_cfg(dest: &Path) {
+pub fn fix_venv_pyvenv_cfg(dest: &Path) {
     let venvs_dir = dest.join("venvs");
     if !venvs_dir.is_dir() {
         return;
@@ -581,7 +581,33 @@ fn write_installed_meta(_dest: &PathBuf) -> Result<()> {
         );
     }
 
-    // 合并写: 读现有 installed.json · 仅覆盖/插入 bundled tier (image/lite/crawl) ·
+    // 2026-06-05 V8.1.13 · hybrid 分层内置:ffmpeg venv 也打进 bundle (imageio-ffmpeg 自带 ffmpeg static)
+    // 内置 venv 拷过来后标 ok · ws hello 上报 software · planner 立刻能派音视频任务 · 0 装机 0 网络
+    let ffmpeg_venv_py = paths::venv_python("ffmpeg");
+    if ffmpeg_venv_py.exists() {
+        tiers.insert(
+            "ffmpeg".into(),
+            InstalledTier {
+                ok: true,
+                python: ffmpeg_venv_py.to_string_lossy().into_owned(),
+                packages: vec!["imageio-ffmpeg"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                software: vec!["ffmpeg", "ffprobe"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                mirror_label: "bundled".into(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                last_message: "客户端内置 ffmpeg venv · 开箱即跑音视频任务 · 0 装机 0 网络".into(),
+                binaries: BTreeMap::new(),
+                installed_skills: BTreeMap::new(),
+            },
+        );
+    }
+
+    // 合并写: 读现有 installed.json · 仅覆盖/插入 bundled tier (lite/crawl/ffmpeg) ·
     // 保留用户自装的 tier (ocr/speech/vision-ai 等) · 避免升级刷新后这些 tier 从上报里消失
     // (detector_write 是整体覆盖 · 若直接构造新 meta 会丢用户 tier 记录)
     let mut meta = read_installed_meta();

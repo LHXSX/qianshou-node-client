@@ -53,6 +53,8 @@ export interface RuntimeTierSpec {
   requires_metal?: boolean
   min_ram_gb?: number
   min_vram_gb?: number
+  /** 2026-06-06 功能分层 · skeleton(骨架)/basic(基本·内置)/advanced(高级·按需)/super(超高级·admin私有) */
+  layer?: string
 }
 
 export interface RuntimeManifest {

@@ -39,9 +39,24 @@ const DEFAULT_INTERVAL_SECS: u64 = 30;
 const DEFAULT_MAX_COUNT: u32 = 1;
 const DEFAULT_MAX_ACTIVE_SHARDS: usize = 1;  // 节点同时只跑 1 个 shard (跟 push 模式对齐 P4.15 "一节点一片")
 
-/// pull 是否启用 (从 env 读 · 后期接 setting UI)
+/// 2026-06-06 · server 经 pull_assign 下发的"下次 pull 等多久" (动态调速 · 防 DDoS)
+/// pull_loop 每轮读它决定 sleep 时长;v8_ws 收 pull_assign 时 set。默认用 env interval。
+static NEXT_PULL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// v8_ws 收 pull_assign 后调 · 更新下次 pull 间隔 (server 限速提示)
+pub fn set_next_pull_ms(ms: u64) {
+    // 夹在 [5s, 600s] · 防异常值
+    let clamped = ms.clamp(5_000, 600_000);
+    NEXT_PULL_MS.store(clamped, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// pull 是否启用 · 2026-06-06 默认开 (让 GEO/爬虫等 pull 任务能被节点主动拉)
+/// 显式 V8_PULL_ENABLED=0/false 关闭 · 其余(含未设)默认开
 fn is_pull_enabled() -> bool {
-    std::env::var("V8_PULL_ENABLED").ok().as_deref() == Some("1")
+    match std::env::var("V8_PULL_ENABLED").ok().as_deref() {
+        Some("0") | Some("false") | Some("off") => false,
+        _ => true,
+    }
 }
 
 /// 间隔秒数 (默认 30s)
@@ -102,12 +117,15 @@ pub async fn pull_loop(
         interval_s, max_count, task_filter,
     );
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(interval_s));
-    // 第一次立即 tick (本次跳过 · 让节点有 5+15s 完成第一次 hb)
-    ticker.tick().await;
+    // 2026-06-06 · 动态间隔:sleep 移到 loop 顶 · server 经 pull_assign 下发的 NEXT_PULL_MS 优先
+    // (continue 跳回顶部也走动态等待 · 防忙时空转)
+    let mut wait_ms: u64 = interval_s * 1000;
 
     loop {
-        ticker.tick().await;
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        // 下轮等待:server 动态限速提示优先 · 否则 env interval
+        let next_ms = NEXT_PULL_MS.load(std::sync::atomic::Ordering::Relaxed);
+        wait_ms = if next_ms > 0 { next_ms } else { interval_s * 1000 };
 
         // 1. 检查节点是否空闲 · 不空闲跳过 (跟 push 模式互让)
         let active_count = active_shards.lock().await.len();

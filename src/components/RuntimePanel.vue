@@ -72,6 +72,11 @@ function fitLabel(level: FitLevel): string {
   return { recommended: "推荐", optional: "可选", incompatible: "不适合" }[level]
 }
 
+// 2026-06-06 功能分层标签 (后端 manifest 下发 layer)
+function layerLabel(layer?: string): string {
+  return ({ skeleton: "骨架", basic: "基本", advanced: "高级", super: "超高级" } as Record<string, string>)[layer || ""] || ""
+}
+
 // 安装是否被门控阻挡 (incompatible 且未确认强装)
 function installBlocked(tier: string): boolean {
   if (forceInstall.value[tier]) return false
@@ -337,6 +342,7 @@ async function refreshAll() {
             {{ tierMetaOf(row.key).label }}
             <span v-if="row.spec.required" class="tc-req">必装</span>
             <span v-if="row.spec.auto_install" class="tc-auto" title="客户端首次启动自动安装 · 无需手动点">自动</span>
+            <span v-if="layerLabel(row.spec.layer)" class="tc-layer" :title="`能力层级:${layerLabel(row.spec.layer)}`">{{ layerLabel(row.spec.layer) }}</span>
             <span class="tc-fit" :class="`fit-${row.fit.level}`" :title="row.fit.reason">{{ fitLabel(row.fit.level) }}</span>
           </div>
           <div class="tc-desc">{{ row.spec.description }}</div>
@@ -598,6 +604,12 @@ async function refreshAll() {
 .hw-v { color: var(--c-fg); font-weight: var(--fw-medium); font-family: ui-monospace, monospace; }
 .hw-v.none { color: var(--c-warn); }
 .hw-hint { margin-left: auto; font-size: var(--fs-2xs); color: var(--c-faint); }
+
+/* ── 功能分层标签 ── */
+.tc-layer {
+  font-size: var(--fs-2xs); padding: 1px 6px; border-radius: var(--r-xs);
+  background: var(--c-bg-soft); color: var(--c-mute); font-weight: var(--fw-medium);
+}
 
 /* ── fit 徽章 ── */
 .tc-fit {
