@@ -439,6 +439,169 @@ pub fn python_candidates(
     out
 }
 
+// ════════════════════════════════════════════════════════════════
+// V8.2 (2026-06-11 RFC 节点执行层重构) · Native binary 路径解析
+// ════════════════════════════════════════════════════════════════
+
+/// 当前进程能访问的 Tauri resource 目录 (内置 binary 落地点)
+/// .app/Contents/Resources/ (macOS) | resources\ (Win) | resources/ (Linux)
+fn tauri_resource_dir() -> Option<PathBuf> {
+    // exe_dir/../Resources (mac) | exe_dir/resources (win/linux Tauri bundle)
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?.to_path_buf();
+    let mac_resources = exe_dir.join("..").join("Resources");
+    if mac_resources.is_dir() {
+        // 规整化路径
+        if let Ok(can) = mac_resources.canonicalize() {
+            return Some(can);
+        }
+    }
+    let other_resources = exe_dir.join("resources");
+    if other_resources.is_dir() {
+        return Some(other_resources);
+    }
+    None
+}
+
+/// 给定 binary 逻辑名 · 找绝对可执行路径
+///
+/// 查找顺序 (高 → 低优先):
+///   1. Tauri bundle 内置: <resources>/bin/<name>(.exe)
+///        prebake-runtime.sh 把 uv 放这里 · prebake-natives.sh 放 ffmpeg/vips/...
+///   2. ffmpeg tier (老 ffmpeg tier 用了不同结构): tier_root("ffmpeg")/bin/<name>
+///        ~/.qianshou/runtime/tiers/ffmpeg/bin/ffmpeg
+///   3. ocr tier (tesseract): tier_root("ocr")/tesseract/<name>
+///        ~/.qianshou/runtime/tiers/ocr/tesseract/tesseract
+///        + Tauri bundle: <resources>/ocr/tesseract/tesseract (prebake-ocr-macos.sh)
+///   4. 系统 PATH: 用 which crate 查
+///   5. 都找不到 → None · 上层 fallback python3
+///
+/// V8.2 设计原则:
+///   - 内置 > tier 安装 > 系统 · 离线优先
+///   - which 兜底为了开发期方便 · 生产应该全部走 1/2/3
+pub fn find_native_binary(name: &str) -> Option<PathBuf> {
+    let name_lower = name.to_lowercase();
+    let exe_name = if cfg!(target_os = "windows") {
+        if name_lower.ends_with(".exe") { name_lower.clone() } else { format!("{}.exe", name_lower) }
+    } else {
+        name_lower.clone()
+    };
+
+    // 1. Tauri resources/bin/<name>
+    if let Some(res) = tauri_resource_dir() {
+        let p = res.join("bin").join(&exe_name);
+        if p.is_file() {
+            return Some(p);
+        }
+        // 平台后缀名变体: bin/ffmpeg-aarch64-apple-darwin 之类
+        // 仅在直接命中失败时扫一下 · 避免每次 IO
+        if let Ok(rd) = std::fs::read_dir(res.join("bin")) {
+            for e in rd.flatten() {
+                let fname = e.file_name().to_string_lossy().to_lowercase();
+                if fname == exe_name || fname.starts_with(&format!("{}-", name_lower)) {
+                    let path = e.path();
+                    if path.is_file() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+        // OCR tesseract 走单独子目录
+        if name_lower == "tesseract" {
+            let tess = res.join("ocr").join("tesseract").join(&exe_name);
+            if tess.is_file() {
+                return Some(tess);
+            }
+        }
+    }
+
+    // 2. ffmpeg tier (老路径 · ~/.qianshou/runtime/tiers/ffmpeg/bin/)
+    for tier in &["ffmpeg", "ocr", "speech", "vision-ai", "lite"] {
+        let p = tier_root(tier).join("bin").join(&exe_name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    // 3. ocr tesseract 单独路径
+    if name_lower == "tesseract" {
+        let p = tier_root("ocr").join("tesseract").join(&exe_name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    // 4. 系统 PATH (which crate)
+    if let Ok(p) = which::which(&name_lower) {
+        return Some(p);
+    }
+    None
+}
+
+/// V8.2 · 列出节点当前支持的所有 native binary
+/// hello 上报给后端 · planner 用此过滤
+pub fn detect_native_binaries() -> Vec<String> {
+    // 跟 task_registry.required_native_binaries() 对齐 · 不在此列的不上报
+    let candidates = [
+        "ffmpeg", "ffprobe",
+        "vips",
+        "pdftotext", "pdfinfo", "pdftoppm",
+        "whisper-cli",
+        "tesseract",
+        "curl",
+    ];
+    candidates
+        .iter()
+        .filter(|n| find_native_binary(n).is_some())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// V8.2 · ONNX 模型存放根目录 (manifest 下发 · 节点拉到这)
+///   ~/.qianshou/runtime/onnx/<model_name>/
+///       det.onnx
+///       rec.onnx
+///       keys.txt
+///       ...
+pub fn onnx_models_root() -> PathBuf {
+    runtime_root().join("onnx")
+}
+
+pub fn onnx_model_dir(model: &str) -> PathBuf {
+    onnx_models_root().join(sanitize_tier(model))
+}
+
+/// V8.2 · 列出节点已装的 ONNX 模型 (hello 上报)
+pub fn detect_onnx_models() -> Vec<String> {
+    let root = onnx_models_root();
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                // 校验目录非空(至少有一个 .onnx 文件)
+                let dir = e.path();
+                let has_onnx = std::fs::read_dir(&dir)
+                    .map(|rd2| {
+                        rd2.flatten().any(|f| {
+                            f.file_name()
+                                .to_string_lossy()
+                                .to_lowercase()
+                                .ends_with(".onnx")
+                        })
+                    })
+                    .unwrap_or(false);
+                if has_onnx {
+                    out.push(e.file_name().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +611,12 @@ mod tests {
         assert_eq!(sanitize_tier("../etc"), "etc");
         assert_eq!(sanitize_tier("lite"), "lite");
         assert_eq!(sanitize_tier("vision-ai"), "vision-ai");
+    }
+
+    #[test]
+    fn onnx_paths_are_under_runtime_root() {
+        let dir = onnx_model_dir("rapid_ocr_v1");
+        assert!(dir.to_string_lossy().contains("onnx"));
+        assert!(dir.to_string_lossy().contains("rapid_ocr_v1"));
     }
 }

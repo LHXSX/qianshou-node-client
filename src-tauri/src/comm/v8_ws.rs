@@ -771,6 +771,11 @@ fn shard_to_task_assign(shard: &ShardAssignPayload) -> TaskAssign {
         // V8.1 · 透传后端发的 venv 路由字段 · executor.rs 用这两个选 venvs/<tier>/bin/python
         required_tier: shard.required_tier.clone(),
         fallback_tiers: shard.fallback_tiers.clone(),
+        // V8.2 (2026-06-11 RFC 节点执行层重构) · 透传执行器选择 + 原生资源
+        executor: shard.executor.clone(),
+        native_binary: shard.native_binary.clone(),
+        native_args: shard.native_args.clone(),
+        onnx_model: shard.onnx_model.clone(),
     }
 }
 
@@ -917,6 +922,33 @@ fn collect_capabilities() -> HashMap<String, Value> {
         "benchmark · CPU={} MB/s · MEM={} GB/s · DISK={} MB/s · SCORE={:.1} · {}ms",
         bench.cpu_sha256_mb_per_sec, bench.memory_gb_per_sec,
         bench.disk_write_mb_per_sec, bench.capability_score, bench.bench_elapsed_ms
+    );
+
+    // V8.2 (2026-06-11 RFC 节点执行层重构) · 上报支持的执行器 + 内置 native binary + 已装 ONNX 模型
+    //
+    // 后端 planner._apply_executor_preference 用这些字段做软排序:
+    //   - 支持 task.executor 的节点排前 · 不支持的排后(走 python3 老路径)
+    //   - 老节点(8.1.x)不上报 · 后端默认为空 list · 一律 fallback python3 · 完全兼容
+    let native_bins = crate::runtime::paths::detect_native_binaries();
+    let onnx_models_avail = crate::runtime::paths::detect_onnx_models();
+    let mut supported_executors: Vec<&str> = Vec::new();
+    if !native_bins.is_empty() {
+        supported_executors.push("native");
+    }
+    // ONNX runtime 仅在编译 feature onnx 时支持
+    #[cfg(feature = "onnx")]
+    {
+        supported_executors.push("onnx");
+    }
+    // http executor 任何 8.2+ 节点都支持(reqwest 已内置 · 几乎零依赖)
+    supported_executors.push("http");
+
+    caps.insert("native_binaries".into(), json!(native_bins));
+    caps.insert("onnx_models".into(), json!(onnx_models_avail));
+    caps.insert("supported_executors".into(), json!(supported_executors));
+    tracing::info!(
+        "V8.2 executor caps · supported_executors={:?} · native_binaries={:?} · onnx_models={:?}",
+        supported_executors, native_bins, onnx_models_avail,
     );
 
     caps

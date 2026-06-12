@@ -22,3 +22,5 @@ pub mod commands;
 pub mod bootstrap_bundled;
 pub mod garbage_collect;
 pub mod auto_install_tiers;
+pub mod onnx_installer;
+pub mod onnxruntime_loader;  // V8.2 (2026-06-11 RFC) · libonnxruntime 跨平台分发

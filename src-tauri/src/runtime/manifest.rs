@@ -166,6 +166,65 @@ pub struct SystemBinarySpec {
     pub sha256: String,
 }
 
+/// V8.2 (2026-06-11 RFC) · 单个 task 的执行器推荐 · 客户端按此选 native/onnx/http/python3
+///
+/// 协议:
+///   "ocr_image":      {"executor":"onnx",    "native_binary":"",       "onnx_model":"rapid_ocr_v1"}
+///   "video_compress": {"executor":"native",  "native_binary":"ffmpeg", "onnx_model":""}
+///   未在此表的 task → 走 python3 老路径
+///
+/// 客户端处理:
+///   - executor="native" + 节点有该 binary → native_runner
+///   - executor="onnx"   + 节点有该模型   → onnx_runner
+///   - 任一缺资源        → 自动 fallback python3
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TaskExecutorSpec {
+    #[serde(default)]
+    pub executor: String,        // "native" / "onnx" / "http" / "python3"
+    #[serde(default)]
+    pub native_binary: String,   // "ffmpeg" / "vips" / "pdftotext" / ...
+    #[serde(default)]
+    pub onnx_model: String,      // "rapid_ocr_v1" / "clip_vit_b32_v1" / ...
+}
+
+/// V8.2 · ONNX 模型单个文件的下载规范
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OnnxFileSpec {
+    pub name: String,                // "ch_PP-OCRv4_det_infer.onnx"
+    pub role: String,                // "det" / "cls" / "rec" / "keys" / "visual" / "textual"
+    pub url: String,                 // 主源 by.wujisuanli.com
+    #[serde(default)]
+    pub fallback_urls: Vec<String>,  // 兜底 GitHub raw / HuggingFace
+    #[serde(default)]
+    pub sha256: String,              // 校验和 · 空串跳过(警告)
+    #[serde(default)]
+    pub size_mb: u32,
+}
+
+/// V8.2 · ONNX 模型组装 · 包含多个文件(det/cls/rec/keys)
+///
+/// 节点拉到 ~/.qianshou/runtime/onnx/<extract_to>/<file_name>
+/// 节点 ort crate 用文件路径直接 load · 不开 Python · 不装 paddleocr/transformers
+/// 跨平台共享同一份模型(ONNX 平台无关)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OnnxModelSpec {
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub license: String,
+    #[serde(default)]
+    pub size_mb: u32,
+    /// 解压到 ~/.qianshou/runtime/onnx/<extract_to>/
+    pub extract_to: String,
+    /// 模型文件列表 · 按 role 区分(det/cls/rec/keys)
+    pub files: Vec<OnnxFileSpec>,
+    /// 安装好后检查这个文件存在 + 非 0 字节
+    #[serde(default)]
+    pub smoke_test: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeManifest {
     #[serde(default)]
@@ -182,6 +241,39 @@ pub struct RuntimeManifest {
     pub mirrors: Vec<MirrorSource>,
     #[serde(default)]
     pub tiers: std::collections::BTreeMap<String, TierSpec>,
+    /// V8.2 (2026-06-11 RFC) · task → executor 推荐表 · 服务端按 task_registry 生成
+    /// 不在此表的 task_type → 走 python3 老路径(向后兼容)
+    #[serde(default)]
+    pub task_executors: std::collections::BTreeMap<String, TaskExecutorSpec>,
+    /// V8.2 · ONNX 模型下发清单 · 客户端按需拉到 ~/.qianshou/runtime/onnx/
+    /// 老客户端 ignore · 不影响现有 python3 任务
+    #[serde(default)]
+    pub onnx_models: std::collections::BTreeMap<String, OnnxModelSpec>,
+    /// V8.2 · libonnxruntime 运行时分发(按平台)· 节点装好后 setenv ORT_DYLIB_PATH
+    /// onnx_models 非空但 onnx_runtime None → 平台不支持 · 节点降级 python3
+    /// 老客户端 ignore · 不影响现有 python3 任务
+    #[serde(default)]
+    pub onnx_runtime: Option<OnnxRuntimeSpec>,
+}
+
+/// V8.2 · libonnxruntime 单平台下载规范
+/// 来源后端 bundles.py::_onnxruntime_spec(platform)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OnnxRuntimeSpec {
+    #[serde(default)]
+    pub version: String,
+    pub url: String,
+    #[serde(default)]
+    pub fallback_urls: Vec<String>,
+    /// "tar.gz" / "zip"
+    pub archive_kind: String,
+    /// 解压后 dylib/so/dll 相对 archive 根目录的路径
+    /// 例如: onnxruntime-osx-arm64-1.18.1/lib/libonnxruntime.dylib
+    pub extracted_binary: String,
+    #[serde(default)]
+    pub size_mb: u32,
+    #[serde(default)]
+    pub sha256: String,
 }
 
 /// API base · 可被 EDGECOMPUTE_API_BASE 覆盖

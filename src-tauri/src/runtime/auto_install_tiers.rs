@@ -55,6 +55,32 @@ async fn run_auto_install(app: &AppHandle) -> anyhow::Result<()> {
         None => return Err(anyhow::anyhow!("拉 manifest 失败 3 次 · 放弃 · 用户可手动装")),
     };
 
+    // V8.2 (2026-06-11 RFC) · ONNX 运行时 + 模型按需下载
+    //   1. libonnxruntime 装好 + setenv ORT_DYLIB_PATH(必须先于第一次 ort 调用)
+    //   2. 跟 tier 安装并行 · 不阻塞主流程
+    //   3. ONNX 文件不大(单模型 < 100MB)
+    //
+    // 顺序要求: ensure_onnxruntime_loaded 先跑(setenv 必须在主线程同步)·
+    //         auto_install_required_models 可后台跑
+    #[cfg(feature = "onnx")]
+    {
+        let m_clone_rt = m.clone();
+        // 装 libonnxruntime · 必须同步等(setenv 要在第一次 ort 调用之前完成)·
+        // 失败不退出 · onnx_runner 自己会 fallback python3
+        if let Err(e) = super::onnxruntime_loader::ensure_onnxruntime_loaded(&m_clone_rt).await {
+            tracing::warn!(
+                "auto_install_tiers · libonnxruntime 未装载 · onnx 任务将 fallback python3 · {}",
+                e
+            );
+        }
+
+        let m_clone = m.clone();
+        tokio::spawn(async move {
+            let n = super::onnx_installer::auto_install_required_models(&m_clone).await;
+            tracing::info!("auto_install_tiers · ONNX 模型就绪 {} 个", n);
+        });
+    }
+
     // 找所有 auto_install=true 的 tier
     let auto_tiers: Vec<String> = m
         .tiers

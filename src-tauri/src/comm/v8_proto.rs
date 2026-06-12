@@ -189,6 +189,17 @@ pub struct ShardAssignPayload {
     pub required_tier: String,
     #[serde(default)]
     pub fallback_tiers: Vec<String>,
+
+    // V8.2 (2026-06-11 RFC 节点执行层重构) · 推荐执行器 + 资源标识
+    // 老后端不发 · serde default 取空 · 客户端 fallback 老 python3 路径 · 完全向后兼容
+    #[serde(default)]
+    pub executor: String,         // "native" / "onnx" / "http" / "python3" / ""
+    #[serde(default)]
+    pub native_binary: String,    // "ffmpeg" / "vips" / "pdftotext" / ...
+    #[serde(default)]
+    pub native_args: Vec<String>, // 服务端预渲染好的命令行参数 (含 {input}/{output}/{tempdir} 占位符)
+    #[serde(default)]
+    pub onnx_model: String,       // "rapid_ocr_v1" / "clip_vit_b32_v1" / ...
 }
 
 fn default_input_kind() -> String { "single_file".into() }

@@ -1,6 +1,6 @@
 [package]
 name = "qianshou-client"
-version = "8.1.14"
+version = "8.2.0"
 description = "千手 · EdgeCompute 边缘算力桌面客户端"
 authors = ["EdgeCompute Team"]
 edition = "2021"
@@ -61,14 +61,29 @@ tar = "0.4"   # 2026-05-24 · ffmpeg tier tar.gz 解压
 opener = "0.7"
 base64 = "0.22"  # W3 (2026-05-26) · IP 代理池 · TunnelChunk 数据 base64 编解码
 
+# ── V8.2 (2026-06-11 RFC 节点执行层重构) · ONNX 推理 ──
+# RapidOCR / CLIP / bge 等模型 · ort crate 直推 · 不开 Python · 不装 paddleocr
+# load-dynamic: 运行时 dlopen libonnxruntime · 不强绑版本 · 包体积小
+# 重要: ort 2.0.x 仍在 RC · ort-sys 跨 RC 版本 ABI 不兼容
+#       必须把 ort + ort-sys 一起精确锁到 rc.4 · 否则 cargo 自动升 ort-sys → 240 个 fn 指针错
+# ndarray 0.15 (跟 ort 2.0.0-rc.4 配对) · image 0.24 配套
+ort = { version = "=2.0.0-rc.4", default-features = false, features = ["load-dynamic", "ndarray"], optional = true }
+ort-sys = { version = "=2.0.0-rc.4", optional = true }
+ndarray = { version = "0.15", optional = true }
+image = { version = "0.24", default-features = false, features = ["jpeg", "png"], optional = true }
+
 # P0 NCE · 任务资源限制 (setpriority 跨平台)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]
-# 默认空，Tauri custom-protocol 由 build.rs 自动注入 release 模式
+# P0 默认只开 custom-protocol · onnx 默认关 · ort 2.0 RC 稳定后再切默认开
+# 关 onnx 时 onnx_runner 退化为 stub · executor 自动 fallback python3 · 跟现状一致 · 零回归
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# V8.2 RFC · ONNX 推理支持 · 启用后客户端能直接跑 RapidOCR/CLIP/bge 模型
+# cargo build --features onnx · 或测试时用 cargo test --features onnx
+onnx = ["dep:ort", "dep:ort-sys", "dep:ndarray", "dep:image"]
 
 
 # ────────────────────────────────────────────────────────────────────

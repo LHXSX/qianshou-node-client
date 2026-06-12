@@ -145,6 +145,53 @@ pub async fn run_task_with_progress(task: &TaskAssign, _node_id: &str) -> TaskRe
 async fn try_run(task: &TaskAssign) -> Result<RunOutcome> {
     let timeout = Duration::from_secs(task.timeout_s.max(1).min(600));
 
+    // V8.2 (2026-06-11 RFC 节点执行层重构) · 优先按服务端建议的 executor 走原生路径
+    //
+    // 路径选择(高 → 低 · 失败自动 fallback):
+    //   1. task.executor=="native"  → native_runner (tokio::process 直调 ffmpeg/vips/...)
+    //   2. task.executor=="onnx"    → onnx_runner (ort crate 直推 RapidOCR/CLIP/...)
+    //   3. task.executor=="http"    → http_runner (P1 · 当前先 fallback script · llm_chat.py 已是 urllib API)
+    //   4. fallback (上面任一失败 + 服务端未指定) → 走老 script/shell/skill_exec 路径
+    //
+    // 关键: native/onnx 失败 (binary 缺 / 模型缺 / feature 关) 时不传播错误 ·
+    //       继续走 python3 路径 · 老节点 + 新节点行为完全兼容
+    if !task.executor.is_empty() {
+        match task.executor.as_str() {
+            "native" => {
+                match super::native_runner::run_native(task, timeout).await {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(e) => {
+                        tracing::warn!(
+                            "executor · native_runner 失败 ({}) · fallback python3 script",
+                            e
+                        );
+                        // continue to legacy path below
+                    }
+                }
+            }
+            "onnx" => {
+                match super::onnx_runner::run_onnx(task, timeout).await {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(e) => {
+                        tracing::warn!(
+                            "executor · onnx_runner 失败 ({}) · fallback python3 script",
+                            e
+                        );
+                        // continue to legacy path below
+                    }
+                }
+            }
+            "http" => {
+                // P1 · http_runner 暂未实现 · 老脚本(llm_chat.py / embedding.py)已是 urllib API · 走原 script 路径
+                tracing::debug!("executor · http executor 暂转 script · llm/embedding 已是 API");
+            }
+            "python3" | "" => {} // 走老路径
+            other => {
+                tracing::warn!("executor · 未知 executor='{}' · fallback python3", other);
+            }
+        }
+    }
+
     // 2026-05-18 v8 收口策略:
     // 节点不内置 task_type · 全部通过 code_url 下载 backend 脚本跑
     // (新增 task 只需后端加 .py · 节点零修改 · 真正可扩展)
@@ -345,7 +392,8 @@ async fn run_shell(task: &TaskAssign, timeout: Duration) -> Result<RunOutcome> {
 /// 读全局 throttle 档位 (从 state.rs 同步 · UI 可改)
 /// AppState 不能被 executor.rs 直读 (避免循环引用) · 用 OnceLock cache
 /// commands.rs::set_throttle_level 会调 update_throttle_level() 同步
-fn current_throttle_level() -> ThrottleLevel {
+/// 2026-06-11 · 改 pub(super) · native_runner/onnx_runner 共用 throttle 档位
+pub(super) fn current_throttle_level() -> ThrottleLevel {
     super::resource_limit::current_level()
 }
 

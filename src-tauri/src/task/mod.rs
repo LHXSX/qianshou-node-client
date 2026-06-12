@@ -3,6 +3,10 @@ pub mod executor;
 pub mod failure_class;
 pub mod llm_ollama;
 pub mod llm_runtime;
+pub mod native_runner;  // V8.2 (2026-06-11 RFC) · native binary 直调 (ffmpeg / vips / poppler / ...)
+pub mod onnx_runner;    // V8.2 (2026-06-11 RFC) · ONNX 推理直推 (RapidOCR / CLIP / bge)
+#[cfg(feature = "onnx")]
+pub mod rapid_ocr;      // V8.2 (2026-06-11 RFC) · RapidOCR PP-OCRv4 真实推理实现
 pub mod pull_worker;  // W1-7 · 节点端 PULL 模式后台抢任务
 pub mod resource_limit;
 pub mod self_heal;
@@ -72,6 +76,28 @@ pub struct TaskAssign {
     /// V8.1 · required_tier 没装时的兜底 tier (按顺序 try)
     #[serde(default)]
     pub fallback_tiers: Vec<String>,
+
+    /// V8.2 (2026-06-11 RFC 节点执行层重构) · 推荐执行器
+    ///   "" / "python3" (默认) → code_url 拉脚本 + venv 跑 (现状)
+    ///   "native"  → tokio::process 直调 native_binary (ffmpeg/vips/...)
+    ///   "onnx"    → ort crate 直推 onnx_model (RapidOCR/CLIP/...)
+    ///   "http"    → reqwest 调平台 API (llm_chat/embedding/crawl)
+    /// 老服务端不发 · 客户端 ignore · 走老 python3 路径 · 完全向后兼容
+    /// 客户端若不支持(supported_executors 不含此值) · 也走 python3 兜底
+    #[serde(default)]
+    pub executor: String,
+    /// V8.2 · executor=native 时指明该 binary 逻辑名 (ffmpeg / vips / pdftotext / ...)
+    /// 客户端 paths::find_native_binary 按此查找
+    #[serde(default)]
+    pub native_binary: String,
+    /// V8.2 · executor=native 时的命令行参数列表 (服务端预渲染好 · 客户端不二次替换 · 防注入)
+    /// 支持占位符: {input} {output} {tempdir} (客户端 native_runner 仅在此 3 个占位符上做替换)
+    #[serde(default)]
+    pub native_args: Vec<String>,
+    /// V8.2 · executor=onnx 时指明该 model 逻辑名 (rapid_ocr_v1 / clip_vit_b32_v1 / ...)
+    /// 客户端 onnx_runner 从 ~/.qianshou/runtime/onnx/<onnx_model>/ load 模型
+    #[serde(default)]
+    pub onnx_model: String,
 }
 
 fn default_task_type() -> String {
