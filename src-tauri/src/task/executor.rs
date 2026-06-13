@@ -899,12 +899,86 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<RunOutcome> 
         command
     };
 
+    // 8.2.1 · 4c.5 preflight: 跑任务前先验证候选 python 能否启动
+    // 修 "子进程秒崩 + stderr 为空 · 后端只看到 exit code 1" 问题。
+    // 用 `python --version` 跑一次 · 失败时拿到完整 OS 错误 / stderr ·
+    // 拼进 RunOutcome.stderr_tail 上报。
+    let mut preflight_diagnostics: Vec<String> = Vec::new();
+    let mut viable: Vec<(String, Vec<std::path::PathBuf>)> = Vec::new();
+    for (runtime_bin, bundled_pythonpath) in candidates.iter() {
+        use std::process::{Command as StdCommand, Stdio};
+        let mut check = StdCommand::new(runtime_bin);
+        check.arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+        crate::proc_util::hide_window_std(&mut check);
+        match check.spawn() {
+            Ok(mut child) => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut ok = false;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(st)) => {
+                            if st.success() {
+                                ok = true;
+                            } else {
+                                let stderr = child.wait_with_output().ok()
+                                    .map(|o| String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())
+                                    .unwrap_or_default();
+                                preflight_diagnostics.push(format!(
+                                    "{} → --version exit={} stderr={}",
+                                    runtime_bin, st.code().unwrap_or(-1), stderr
+                                ));
+                            }
+                            break;
+                        }
+                        Ok(None) => {
+                            if std::time::Instant::now() > deadline {
+                                let _ = child.kill();
+                                preflight_diagnostics.push(format!(
+                                    "{} → --version 超时 5s · venv 严重损坏", runtime_bin
+                                ));
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(30));
+                        }
+                        Err(e) => {
+                            preflight_diagnostics.push(format!("{} → wait 失败: {}", runtime_bin, e));
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    viable.push((runtime_bin.clone(), bundled_pythonpath.clone()));
+                }
+            }
+            Err(e) => {
+                preflight_diagnostics.push(format!("{} → spawn 失败: {}", runtime_bin, e));
+            }
+        }
+    }
+    if viable.is_empty() {
+        return Err(anyhow!(
+            "节点无可用 Python:{} 个候选 preflight 全部失败 (任务前自检拿到的诊断 · 已上报后端):\n{}",
+            candidates.len(),
+            preflight_diagnostics.join("\n")
+        ));
+    }
+    if !preflight_diagnostics.is_empty() {
+        tracing::warn!(
+            "executor · preflight 剔除 {} 个不可用候选: {}",
+            preflight_diagnostics.len(),
+            preflight_diagnostics.join(" | ")
+        );
+    }
+
     // 4d. 逐个候选 try-spawn · 第一个能起来的就用 (Win: venv 坏/缺则自动退到下一个)
     let mut child_opt = None;
     let mut used_py = String::new();
     let mut last_err = String::new();
-    let total = candidates.len();
-    for (i, (runtime_bin, bundled_pythonpath)) in candidates.iter().enumerate() {
+    let total = viable.len();
+    for (i, (runtime_bin, bundled_pythonpath)) in viable.iter().enumerate() {
         match build_cmd(runtime_bin, bundled_pythonpath).spawn() {
             Ok(c) => {
                 if i > 0 {
@@ -930,9 +1004,8 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<RunOutcome> 
         Some(c) => c,
         None => {
             return Err(anyhow!(
-                "节点无可用 Python:{} 个候选全部启动失败 (最后: {})。\
-                 请确认 lite runtime 已安装 (~/.qianshou/runtime/venvs/lite)",
-                total, last_err
+                "节点无可用 Python:preflight 通过 {} 个候选但 spawn 全失败 (最后: {} | preflight 诊断: {})",
+                total, last_err, preflight_diagnostics.join(" | ")
             ))
         }
     };
@@ -958,7 +1031,8 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<RunOutcome> 
             // 2026-05-18 · 只返 stdout (脚本约定 stdout = JSON 结果)
             // stderr 走本地 tracing (PIL warnings 等不污染 output_ref · 避免 aggregator parse 失败)
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr_tail = tail_stderr(&output.stderr, 2048);
+            let mut stderr_tail = tail_stderr(&output.stderr, 2048);
+            let exit_code = output.status.code().unwrap_or(-1);
             if !output.stderr.is_empty() {
                 let stderr_str = String::from_utf8_lossy(&output.stderr);
                 tracing::warn!(
@@ -967,9 +1041,39 @@ async fn run_script(task: &TaskAssign, timeout: Duration) -> Result<RunOutcome> 
                     if stderr_str.len() > 500 { &stderr_str[..500] } else { &stderr_str }
                 );
             }
+            // 8.2.1 · 失败但 stderr 为空 (Windows venv 启动期 OS 层崩) ·
+            // 拼上诊断信息让后端能定位 · 否则后端只看到 "exit code 1" 无从下手
+            if exit_code != 0 && output.stderr.is_empty() {
+                let mut diag = String::new();
+                diag.push_str(&format!(
+                    "[client diagnostic · 子进程 exit={} 但 stderr 为空 · 可能 venv 启动期 OS 层崩]\n",
+                    exit_code
+                ));
+                diag.push_str(&format!("python_used={}\n", used_py));
+                let pyp = std::path::Path::new(&used_py);
+                diag.push_str(&format!("exists={} ", pyp.exists()));
+                if let Some(parent) = pyp.parent() {
+                    diag.push_str(&format!("parent_exists={} ", parent.exists()));
+                }
+                if let Some(venv_root) = pyp.parent().and_then(|p| p.parent()) {
+                    let cfg = venv_root.join("pyvenv.cfg");
+                    diag.push_str(&format!("pyvenv.cfg_exists={}", cfg.exists()));
+                    if cfg.exists() {
+                        if let Ok(s) = std::fs::read_to_string(&cfg) {
+                            let preview: String = s.chars().take(400).collect();
+                            diag.push_str(&format!("\npyvenv.cfg={}", preview));
+                        }
+                    }
+                }
+                if !stdout.is_empty() {
+                    let preview: String = stdout.chars().take(500).collect();
+                    diag.push_str(&format!("\nstdout_preview={}", preview));
+                }
+                stderr_tail = diag;
+            }
             Ok(RunOutcome {
                 output: stdout,
-                exit_code: output.status.code().unwrap_or(-1),
+                exit_code,
                 stderr_tail,
                 python_used: used_py,
             })

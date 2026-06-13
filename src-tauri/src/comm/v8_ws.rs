@@ -112,6 +112,18 @@ async fn run_v8_session(state: &Arc<AppState>, app: &AppHandle, token: &str) -> 
 
     // ── 1. send hello ──
     let worker_id = node_store::load_node_id();
+    // 8.2.1 · hello 前同步跑 boot smoke test (阻塞 · 整批 ≤10s)
+    // 验证每个 tier 的 venv python 能否启动 (NSIS 烘焙 venv 可能假装 ok ·
+    // 见 bootstrap_bundled.rs 直接标 t.ok=true 不真验证) ·
+    // 不通过的 tier 标 t.ok=false 持久化 · 让 hello 上报真实可用 tier。
+    let (alive_tiers, fake_tiers) = crate::runtime::detector::boot_smoke_test_and_persist();
+    if !fake_tiers.is_empty() {
+        tracing::warn!(
+            "hello · 剔除 {} 个假装 ok 的 tier (broker 不会再派任务到这些 tier): {:?} · 真实可用 {} 个: {:?}",
+            fake_tiers.len(), fake_tiers, alive_tiers.len(), alive_tiers
+        );
+    }
+
     // 8.1.9 · 后台预热能力探针 (专用线程,不阻塞 WS 异步循环) ·
     // 几十秒后缓存就绪 → 后续心跳上报真实可用 software
     crate::runtime::detector::spawn_probe_warmup();

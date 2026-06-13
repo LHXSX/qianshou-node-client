@@ -279,6 +279,149 @@ pub fn invalidate_probe_cache() {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// 8.2.1 · 启动 boot smoke test · 治 bundled venv 假装 ok 的问题
+//
+// 问题: NSIS 烘焙的 cpython + venvs 解到 ~/.qianshou/runtime 后 ·
+//       bootstrap_bundled.rs 直接把所有 tier 标 t.ok=true · 不真跑验证 ·
+//       venv 内 pyvenv.cfg / site-packages 任何问题都被吹成 "已装好" ·
+//       broker 派任务到节点后子进程秒崩 (exit code 1 · stderr 为空)。
+//
+// 方案: 启动时同步并发跑 `<venv>/python --version` 验证每个 tier 的
+//       python.exe 能否正常启动 · 不通过的标 t.ok=false 持久化 ·
+//       hello 阶段 capabilities.runtime_tiers 只上报真能启动的子集。
+// ════════════════════════════════════════════════════════════════════
+
+/// 单 tier smoke: 用 venv python 跑 `--version` · 5s 超时 · 返回 (ok, 失败原因)
+fn smoke_one_tier(tier_name: &str, python_path: &str) -> (bool, String) {
+    use std::process::{Command as StdCommand, Stdio};
+    if python_path.is_empty() {
+        return (false, format!("tier={} 无 venv python 路径", tier_name));
+    }
+    if !std::path::Path::new(python_path).exists() {
+        return (false, format!("tier={} python 路径不存在: {}", tier_name, python_path));
+    }
+    let mut cmd = StdCommand::new(python_path);
+    cmd.arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    crate::proc_util::hide_window_std(&mut cmd);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            // OS 层错误 (DLL not found / 找不到文件 / 权限不足 ...)
+            return (false, format!("spawn 失败: {} ({})", python_path, e));
+        }
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                if st.success() {
+                    return (true, String::new());
+                }
+                let stderr = child
+                    .wait_with_output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())
+                    .unwrap_or_default();
+                return (
+                    false,
+                    format!(
+                        "python --version exit={} stderr={}",
+                        st.code().unwrap_or(-1),
+                        stderr
+                    ),
+                );
+            }
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    return (false, format!("python --version 超时 5s · {}", python_path));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return (false, format!("wait 失败: {}", e)),
+        }
+    }
+}
+
+/// 启动 boot smoke test (阻塞 · 并发跑所有 tier · 整批超时 10s)
+///
+/// 对每个 installed.json 里 t.ok=true 的 tier 跑 `python --version` ·
+/// 失败的标 t.ok=false + last_message="boot_smoke_failed: ..." · 持久化 ·
+/// 返回 (验证通过的 tier 名集合, 假装 ok 的 tier 名集合)。
+///
+/// 在 hello 前调用一次 · 让 capabilities 上报真实可用 tier。
+pub fn boot_smoke_test_and_persist() -> (Vec<String>, Vec<String>) {
+    let mut meta = read_installed_meta();
+    let tiers_to_check: Vec<(String, String)> = meta
+        .tiers
+        .iter()
+        .filter(|(_, t)| t.ok && !t.python.is_empty())
+        .map(|(name, t)| (name.clone(), t.python.clone()))
+        .collect();
+
+    if tiers_to_check.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // 并发跑所有 tier · 各自 5s 超时 · 整批 10s 兜底
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel::<(String, bool, String)>();
+    let total = tiers_to_check.len();
+    for (name, py) in tiers_to_check {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let (ok, msg) = smoke_one_tier(&name, &py);
+            let _ = tx.send((name, ok, msg));
+        });
+    }
+    drop(tx);
+
+    let mut alive: Vec<String> = Vec::new();
+    let mut fake: Vec<String> = Vec::new();
+    let batch_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut received = 0;
+    while received < total {
+        let remaining = batch_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok((name, ok, msg)) => {
+                received += 1;
+                if ok {
+                    alive.push(name);
+                } else {
+                    if let Some(t) = meta.tiers.get_mut(&name) {
+                        t.ok = false;
+                        t.last_message = format!("boot_smoke_failed: {}", msg);
+                    }
+                    fake.push(name.clone());
+                    tracing::warn!("boot_smoke · tier={} FAIL · {}", name, msg);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    if !fake.is_empty() {
+        if let Err(e) = write_installed_meta(&meta) {
+            tracing::warn!("boot_smoke · 持久化 installed.json 失败: {}", e);
+        } else {
+            tracing::info!(
+                "boot_smoke · 完成 · 真实可用 {} 个 · 剔除假装 {} 个: {:?}",
+                alive.len(), fake.len(), fake
+            );
+        }
+    } else {
+        tracing::info!("boot_smoke · 完成 · {} 个 tier 全部通过验证", alive.len());
+    }
+    (alive, fake)
+}
+
 /// 8.1.9 · 非阻塞读缓存 (绝不触发同步探针) · 给 WS 主循环用。
 /// 缓存未就绪返回 None,调用方应回退到 manifest 兜底,**不能**在主循环里同步跑 probe
 /// (probe 要起 python import 重型包 · 最长 90s · 会阻塞 WS 事件循环 → 节点收不到任务/不回结果)。
